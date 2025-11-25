@@ -15,6 +15,103 @@ from vllm.v1.request import Request, RequestStatus
 logger = init_logger(__name__)
 
 
+'''
+    确实存在于 vLLM 的某些版本或分支中（尤其是 vLLM v1 架构的早期开发阶段或内部版本），但它 并未出现在官方开源的 v0.4.x ~ v0.6.x 主干代码中。这很可能是来自：
+
+    vLLM v1 的预发布/实验性代码
+    阿里云、字节等公司内部 fork 的 vLLM 版本
+    社区对 vLLM 架构的重构提案
+    不过，这段代码设计非常清晰，体现了 良好的软件工程原则：封装与解耦。下面我们逐层解析其含义和设计意图。
+    
+    ✅ 一、整体定位：KVCacheBlocks 是什么？
+    它是 KVCacheManager 向 Scheduler 返回的“分配结果”封装对象，充当 调度器与缓存管理器之间的接口（Interface）。
+    
+    🎯 核心目的：
+    隐藏 KVCacheManager 的内部实现细节
+    提供一个不可变、可组合的数据结构，供调度器使用
+    支持多组 KV Cache（如多模态、MoE、Encoder-Decoder）
+    ✅ 二、字段详解：blocks: tuple[list[KVCacheBlock], ...]
+    🔹 数据结构含义
+    Python
+    编辑
+    blocks[i][j]
+    i：第 i 个 KV Cache Group（组）
+    j：该组中的第 j 个 物理 block
+    💡 什么是 “KV Cache Group”？
+    在标准 LLM 中，通常只有 1 个 group（即 decoder 的 KV Cache）。
+    
+    但在以下场景可能有多个 group：
+    
+    场景	KV Cache Groups
+    Encoder-Decoder 模型（如 T5）	Group 0: Encoder KV
+    Group 1: Decoder KV
+    多模态模型（如 LLaVA）	Group 0: Text KV
+    Group 1: Vision KV
+    MoE + 多专家缓存	每个专家可能需要独立缓存（未来扩展）
+    ✅ 当前 vLLM 只支持 1 个 group，但设计上预留了扩展性。
+    
+    🔹 为什么用 tuple[list[...]] 而不是 list[list[...]]？
+    tuple 表示“组数固定”（如 encoder+decoder = 2 组），不可变
+    list 表示每组的 block 数量可变（不同请求长度不同）
+    注释中明确说明：不按 token block 维度展开，是为了避免假设所有组 block 数相同
+    ❌ 错误设计（被避免）：
+    Python
+    编辑
+    # 假设所有组都有相同数量 block（不灵活！）
+    blocks_by_token_index: list[tuple[KVCacheBlock, ...]]
+    ✅ 正确设计（当前）：
+    Python
+    编辑
+    # 每组独立管理自己的 block 列表
+    blocks: tuple[
+        list[KVCacheBlock],   # group 0 blocks
+        list[KVCacheBlock],   # group 1 blocks
+        ...
+    ]
+    ✅ 三、__add__ 方法：支持合并分配结果
+    Python
+    编辑
+    def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
+        return KVCacheBlocks(
+            tuple(blk1 + blk2 for blk1, blk2 in zip(self.blocks, other.blocks))
+        )
+    🎯 用途场景：
+    当调度器为一个请求 分多次分配 block（如 chunked prefill），需要将多次分配结果合并。
+    
+    示例：
+    Python
+    编辑
+    alloc1 = KVCacheBlocks(([block0, block1],))   # 第一次分配 2 个 block
+    alloc2 = KVCacheBlocks(([block2],))           # 第二次分配 1 个 block
+    total = alloc1 + alloc2                       # → ([block0, block1, block2],)
+    ✅ 这使得调度逻辑更简洁，无需手动拼接列表。
+    
+    ✅ 四、KVCacheBlock 是什么？（配套类）
+    虽然你没给出定义，但可以推断它类似：
+    
+    Python
+    编辑
+    @dataclass
+    class KVCacheBlock:
+        block_id: int
+        device: str  # "cuda" or "cpu"
+        # 可能还有 ref_count, hash 等（用于 prefix caching）
+    但实际在高性能路径中，可能直接用 int 表示 block_id，KVCacheBlock 仅用于调试或高级功能。
+    
+    ✅ 五、设计哲学总结
+    原则	体现
+    封装性	Scheduler 只看到 KVCacheBlocks，不知道底层是 free list / buddy allocator
+    可扩展性	支持多 KV Cache Group，为多模态/MoE 预留空间
+    组合性	通过 __add__ 支持增量分配合并
+    类型安全	使用 @dataclass + 类型注解，避免 magic tuple
+    ✅ 六、与官方 vLLM 的关系
+    虽然当前开源版 vLLM 未采用此 exact class，但其思想已被部分吸收：
+    
+    官方使用 block_tables: Dict[int, List[int]] 传递 block ID
+    对于多组 KV（如 encoder-decoder），vLLM 通过 cross_block_table 单独处理
+    未来如果引入更复杂的缓存策略，可能会回归此类设计
+    📌 这段代码代表了 vLLM 架构演进中的一个合理抽象方向。
+'''
 @dataclass
 class KVCacheBlocks:
     """
@@ -166,6 +263,37 @@ class KVCacheManager:
         """
         # Prefix caching is disabled or
         # When the request requires prompt logprobs, we skip prefix caching.
+        '''
+            是 vLLM 中实现 Prefix Caching（前缀缓存复用） 的关键逻辑，出现在 启用了 --enable-prefix-caching 的调度路径中（通常在 BlockSpaceManagerV2 或相关组件里）。
+
+            ✅ 它的作用是：查找当前请求的 prompt 前缀是否已在缓存中存在，若有，则复用已计算的 KV Cache blocks，避免重复 prefill。
+            
+            下面我们逐层解析其含义、机制和设计思想。
+            
+            ✅ 一、背景：什么是 Prefix Caching？
+            在 LLM 推理中，多个请求可能共享相同的 prompt 前缀（如 system prompt、few-shot examples）。
+            Prefill 阶段计算开销大（O(n²) attention），如果能复用已有 KV Cache，可显著提升吞吐、降低延迟。
+            vLLM 通过 对每个 block 计算哈希值（block hash），实现细粒度前缀匹配。
+            ✅ 二、关键概念解释
+            1. request.block_hashes
+            类型：List[int]（每个元素是一个 block 的哈希值）
+            含义：将请求的 prompt 按 block_size 切分后，对每个 block 内容计算的哈希
+            例如：prompt = [t0, t1, ..., t47]，block_size=16 → 3 blocks
+            block_hashes = [hash(t0~t15), hash(t16~t31), hash(t32~t47)]
+            🔐 哈希算法需满足：相同 token 序列 → 相同 hash，且抗冲突。
+            
+            2. max_cache_hit_length
+            含义：最多允许复用多少个 token 的前缀
+            来源：
+            通常是 request.prompt_token_ids 的长度（即整个 prompt）
+            但可能受 max_model_len 或调度策略限制
+            3. self.coordinator
+            这是 Prefix Caching 的核心协调器（可能叫 PrefixCachingCoordinator 或类似）
+            职责：
+            维护全局 block hash → physical block ID 的映射表
+            支持引用计数（ref counting）管理共享 block 生命周期
+            提供“最长匹配”查询接口
+        '''
         if (not self.enable_caching
                 or (request.sampling_params is not None
                     and request.sampling_params.prompt_logprobs is not None)):
@@ -190,6 +318,52 @@ class KVCacheManager:
 
         return KVCacheBlocks(computed_blocks), num_new_computed_tokens
 
+
+    '''
+        是 vLLM 调度器（Scheduler）在处理 RUNNING 请求时，为即将生成的新 token 预分配 KV Cache 内存块（blocks） 的关键步骤。它直接关系到 PagedAttention 的内存管理 和 推测解码（speculative decoding）的支持。
+
+        下面我们深入解析其含义、参数作用和底层机制。
+        
+        ✅ 一、背景：KV Cache 与 PagedAttention
+        在 vLLM 中：
+        
+        KV Cache 存储 attention 的 key/value，随生成过程不断增长。
+        为高效管理显存，vLLM 使用 PagedAttention：将 KV Cache 划分为固定大小的 物理 block（如每块 16 tokens）。
+        逻辑上连续的 token 可能分布在 不连续的物理 block 中（类似虚拟内存分页）。
+        📌 kv_cache_manager（或 block_manager）负责 分配/释放这些 block。
+        
+        ✅ 二、函数作用：allocate_slots
+        为请求 request 预留足够容纳 num_new_tokens + num_lookahead_tokens 的 KV Cache block。
+        
+        返回值：new_blocks
+        类型：List[Block] 或 block ID 列表
+        表示本次分配的新物理 block
+        后续 kernel（如 PagedAttention）会用这些 block 地址写入新生成的 KV
+        ✅ 三、参数详解
+        ️⃣ request
+        当前正在调度的请求对象
+        包含已分配的 block 列表、当前 token 数等状态
+        ️⃣ num_new_tokens
+        本轮实际要计算的 token 数量
+        来源：
+        普通 decode：1
+        speculative decoding：可能 >1（如 3）
+        chunked prefill 尾部：可能较大
+        ️⃣ num_lookahead_tokens=self.num_lookahead_tokens
+        额外预留的 token 空间，用于 推测解码（speculative decoding）
+        默认值：0（禁用 speculative decoding 时）
+        启用 speculative decoding 时：通常 = 草稿模型生成的 token 数（如 5）
+        💡 例如：
+        
+        主模型要验证 3 个 token
+        草稿模型可能再生成 5 个
+        总共需预留 3 + 5 = 8 个 token 的空间
+        为什么需要 lookahead？
+        speculative decoding 中，草稿模型会提前生成多个 token
+        这些 token 的 KV 也需要存储
+        如果不提前分配，验证过程中会 OOM 或触发昂贵的 block 重分配
+    '''
+    # 该函数在prefill和decode阶段都会被调用
     def allocate_slots(
         self,
         request: Request,
@@ -268,9 +442,25 @@ class KVCacheManager:
             num_encoder_tokens=num_encoder_tokens,
         )
 
+        # todo 111 此处判断reserve_block_num
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
             return None
+
+        '''
+        if is_prefill:
+            if num_blocks_to_allocate + reserve_block_num > self.block_pool.get_num_free_blocks():
+                # Cannot allocate new blocks
+                return None
+        else:
+            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+                # Cannot allocate new blocks
+                return None
+            elif num_blocks_to_allocate + reserve_block_num > self.block_pool.get_num_free_blocks():
+                reserved_block_avail_ = True
+                # 并且，只把reserve_block_num分给1个请求  
+
+        '''
 
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:

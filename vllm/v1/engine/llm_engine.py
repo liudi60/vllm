@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from copy import copy
 from typing import Any, Callable, Optional, Union
 
+import inspect
+
 import torch.nn as nn
 from typing_extensions import TypeVar
 
@@ -56,6 +58,15 @@ class LLMEngine:
         use_cached_outputs: bool = False,
         multiprocess_mode: bool = False,
     ) -> None:
+
+        logger.warning(f'===== LLMEngine构造函数')
+
+        # 获取调用栈
+        caller_frame = inspect.currentframe().f_back
+        if caller_frame:
+            caller_info = inspect.getframeinfo(caller_frame)
+            logger.warning(f'===== caller_info={caller_info}')
+
         if not envs.VLLM_USE_V1:
             raise ValueError(
                 "Using V1 LLMEngine, but envs.VLLM_USE_V1=False. "
@@ -148,6 +159,9 @@ class LLMEngine:
         stat_loggers: Optional[list[StatLoggerFactory]] = None,
         disable_log_stats: bool = False,
     ) -> "LLMEngine":
+
+        logger.warning(f'===== 创建LLMEngine实例, 使用LLMEngine.from_vllm_config')
+
         return cls(vllm_config=vllm_config,
                    executor_class=Executor.get_class(vllm_config),
                    log_stats=(not disable_log_stats),
@@ -164,6 +178,8 @@ class LLMEngine:
         enable_multiprocessing: bool = False,
     ) -> "LLMEngine":
         """Creates an LLM engine from the engine arguments."""
+
+        logger.warning(f'===== 创建LLMEngine实例, 使用LLMEngine.from_engine_args')
 
         # Create the engine configs.
         vllm_config = engine_args.create_engine_config(usage_context)
@@ -210,6 +226,7 @@ class LLMEngine:
         request_ids = self.output_processor.abort_requests(request_ids)
         self.engine_core.abort_requests(request_ids)
 
+    # 添加请求到input_queue
     def add_request(
         self,
         request_id: str,
@@ -237,7 +254,8 @@ class LLMEngine:
             # Make a new RequestState and queue.
             self.output_processor.add_request(request, prompt_str, None, 0)
             # Add the request to EngineCore.
-            self.engine_core.add_request(request)
+            logger.warning(f'===== LLMEngine add_request self.engine_core.add_request, request={request} ')
+            self.engine_core.add_request(request)  # 这里会走到SyncMPClient实现类
             return
 
         # Fan out child requests (for n>1).

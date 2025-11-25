@@ -93,6 +93,19 @@ class CoreEngineProcManager:
         log_stats: bool,
         client_handshake_address: Optional[str] = None,
     ):
+        '''
+        multiprocessing.get_context()是一个非常重要的函数，用于获取特定上下文的多进程环境。
+        基本用法：
+        try:
+            ctx = multiprocessing.get_context('fork')
+            process = ctx.Process(target=worker_function)
+
+            process.start()
+            process.join()
+
+        except Exception as e:
+            print(f"错误: {e}")
+        '''
         context = get_mp_context()
         common_kwargs = {
             "vllm_config": vllm_config,
@@ -114,7 +127,11 @@ class CoreEngineProcManager:
 
             # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
+            # todo CoreEngineProcManager在构造函数中启动
+            # ===== CoreEngineProcManager构造函数中创建子进程, local_engine_count=1, target_fn=<function EngineCoreProc.run_engine_core at 0xfffcd875c720>
+            logger.warning(f'===== CoreEngineProcManager构造函数中创建子进程, local_engine_count={local_engine_count}, target_fn={target_fn}')
             self.processes.append(
+                # 启动EngineCore进程
                 context.Process(target=target_fn,
                                 name=f"EngineCore_DP{global_index}",
                                 kwargs=common_kwargs | {
@@ -126,11 +143,12 @@ class CoreEngineProcManager:
 
         data_parallel = vllm_config.parallel_config.data_parallel_size > 1
         try:
+            logger.warning(f'===== len(self.processes)={len(self.processes)} self.processes={self.processes}')
             for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
                 with set_device_control_env_var(
                         vllm_config, local_dp_rank) if (
                             data_parallel) else contextlib.nullcontext():
-                    proc.start()
+                    proc.start()  # todo 子进程启动
         finally:
             # Kill other procs if not all are running.
             if self.finished_procs():
@@ -710,6 +728,7 @@ def launch_core_engines(
 
         from vllm.v1.engine.core import EngineCoreProc
 
+        # todo CoreEngineProcManager构造函数中启动EngineCoreProc进程
         # Start local engines.
         if local_engine_count:
             local_engine_manager = CoreEngineProcManager(
@@ -728,6 +747,9 @@ def launch_core_engines(
 
         yield local_engine_manager, coordinator, addresses
 
+        logger.warning(f'===== launch_core_engines wait_for_engine_startup 等待启动EngineCoreProc进程  ')
+
+        # todo 等待EngineCoreProc子进程初始化工作（子进程间握手同步）完成
         # Now wait for engines to start.
         wait_for_engine_startup(
             handshake_socket,

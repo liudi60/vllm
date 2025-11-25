@@ -102,6 +102,7 @@ class EncoderCacheManager:
     def can_allocate(self, request: Request, input_id: int,
                      encoder_compute_budget: int,
                      num_tokens_to_schedule: int) -> bool:
+        logger.warning(f'===== 调用EncoderCacheManager.can_allocate函数')  # 不调用这里
         """Check if there's sufficient cache space for a multimodal input. 
         If there is, return True and update EncoderCacheManager state.
 

@@ -14,6 +14,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import Thread
 from typing import Any, Callable, Optional, TypeVar, Union
+import json
 
 import msgspec.msgpack
 import zmq
@@ -57,6 +58,7 @@ class EngineCoreClient(ABC):
     * AsyncMPClient: ZMQ + background proc EngineCore w/ asyncio (for AsyncLLM)
     """
 
+    # todo v1服务化启动不走这里，而是创建 AsyncMPClient(*client_args) 实例
     @staticmethod
     def make_client(
         multiprocess_mode: bool,
@@ -73,12 +75,15 @@ class EngineCoreClient(ABC):
                 "is not currently supported.")
 
         if multiprocess_mode and asyncio_mode:
+            logger.warning(f'===== EngineCoreClient.make_client, 创建make_async_mp_client')
             return EngineCoreClient.make_async_mp_client(
                 vllm_config, executor_class, log_stats)
 
         if multiprocess_mode and not asyncio_mode:
+            logger.warning(f'===== EngineCoreClient.make_client, 创建SyncMPClient')
             return SyncMPClient(vllm_config, executor_class, log_stats)
 
+        logger.warning(f'===== EngineCoreClient.make_client, 创建InprocClient')
         return InprocClient(vllm_config, executor_class, log_stats)
 
     @staticmethod
@@ -99,6 +104,7 @@ class EngineCoreClient(ABC):
                 return DPAsyncMPClient(*client_args)
             # Internal load balancer - client balances to all DP ranks.
             return DPLBAsyncMPClient(*client_args)
+        logger.warning(f'===== EngineCoreClient.make_async_mp_client中创建AsyncMPClient实例')
         return AsyncMPClient(*client_args)
 
     @abstractmethod
@@ -242,6 +248,7 @@ class InprocClient(EngineCoreClient):
     """
 
     def __init__(self, *args, **kwargs):
+        logger.warning(f'===== InprocClient构造函数中实例化EngineCore, self.engine_core = EngineCore(*args, **kwargs)')
         self.engine_core = EngineCore(*args, **kwargs)
 
     def get_output(self) -> EngineCoreOutputs:
@@ -445,6 +452,7 @@ class MPClient(EngineCoreClient):
                     "stats_update_address")
             else:
                 # Engines are managed by this client.
+                logger.warning(f'===== 在MPClient构造函数中启动EngineCoreProc进程')
                 with launch_core_engines(vllm_config, executor_class,
                                          log_stats) as (engine_manager,
                                                         coordinator,
@@ -492,6 +500,7 @@ class MPClient(EngineCoreClient):
             identities = set(self.core_engines)
             sync_input_socket = zmq.Socket.shadow(self.input_socket)
             while identities:
+                # 握手
                 if not sync_input_socket.poll(timeout=600_000):
                     raise TimeoutError("Timed out waiting for engines to send"
                                        "initial message on input socket.")
@@ -597,6 +606,33 @@ def _process_utility_output(output: UtilityOutput,
 class SyncMPClient(MPClient):
     """Synchronous client for multi-proc EngineCore."""
 
+    logger.warning(f'===== 创建SyncMPClient实例')
+
+    # 获取调用栈
+    import inspect
+    caller_frame = inspect.currentframe().f_back
+    if caller_frame:
+        caller_info = inspect.getframeinfo(caller_frame)
+        logger.warning(f'===== SyncMPClient caller_info={caller_info}')
+
+    """获取完整的调用栈"""
+    stack = inspect.stack()
+    stack_details = []
+
+    for frame_info in stack[1:]:  # 跳过当前函数
+        frame, filename, lineno, function, code_line, index = frame_info
+        stack_details.append({
+            'filename': filename,
+            'line_number': lineno,
+            'function': function,
+            'code_line': code_line
+        })
+    # logger.warning(f'===== all stack_details={stack_details}')
+    logger.warning(f'===== SyncMPClient all stack_details={json.dumps(stack_details, indent=4)}')
+
+
+
+
     def __init__(self, vllm_config: VllmConfig, executor_class: type[Executor],
                  log_stats: bool):
         super().__init__(
@@ -675,16 +711,23 @@ class SyncMPClient(MPClient):
     def _send_input(self, request_type: EngineCoreRequestType, request: Any):
         self.ensure_alive()
         self.free_pending_messages()
+
+        logger.warning(f'+++++ 3.endcode & send req ')
+
+        # todo encode
         # (Identity, RequestType, SerializedRequest)
         msg = (self.core_engine, request_type.value,
                *self.encoder.encode(request))
+
+        logger.warning(f'===== encoded req={msg}')
 
         if len(msg) <= 3:
             # No auxiliary buffers => no tensor backing buffers in request.
             self.input_socket.send_multipart(msg, copy=False)
             return
 
-        tracker = self.input_socket.send_multipart(msg, copy=False, track=True)
+        # todo send req
+        tracker = self.input_socket.send_multipart(msg, copy=False, track=True)  # 通过zmq的socket发送请求
         self.add_pending_message(tracker, request)
 
     def call_utility(self, method: str, *args) -> Any:

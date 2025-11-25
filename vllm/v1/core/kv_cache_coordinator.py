@@ -10,7 +10,9 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.request import Request
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 
 class KVCacheCoordinator(ABC):
     """
@@ -29,7 +31,95 @@ class KVCacheCoordinator(ABC):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
-
+        # ===== KVCacheCoordinator实例化，子类：UnitaryKVCacheCoordinator
+        logger.warning(f'===== KVCacheCoordinator实例化，子类：{self.__class__.__name__}')
+        '''
+            KVCacheConfig(
+                num_blocks=5434,
+                kv_cache_tensors=[KVCacheTensor(size=1424490496, shared_by=['model.layers.0.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.1.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.2.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.3.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.4.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.5.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.6.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.7.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.8.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.9.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.10.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.11.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.12.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.13.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.14.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.15.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.16.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.17.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.18.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.19.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.20.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.21.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.22.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.23.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.24.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.25.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.26.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.27.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.28.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.29.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.30.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.31.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.32.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.33.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.34.self_attn.attn']),
+                    KVCacheTensor(size=1424490496, shared_by=['model.layers.35.self_attn.attn'])],
+                kv_cache_groups=[KVCacheGroupSpec(layer_names=['model.layers.0.self_attn.attn',
+                                                                'model.layers.1.self_attn.attn',
+                                                                'model.layers.2.self_attn.attn',
+                                                                'model.layers.3.self_attn.attn',
+                                                                'model.layers.4.self_attn.attn',
+                                                                'model.layers.5.self_attn.attn',
+                                                                'model.layers.6.self_attn.attn',
+                                                                'model.layers.7.self_attn.attn',
+                                                                'model.layers.8.self_attn.attn',
+                                                                'model.layers.9.self_attn.attn',
+                                                                'model.layers.10.self_attn.attn',
+                                                                'model.layers.11.self_attn.attn',
+                                                                'model.layers.12.self_attn.attn',
+                                                                'model.layers.13.self_attn.attn',
+                                                                'model.layers.14.self_attn.attn',
+                                                                'model.layers.15.self_attn.attn',
+                                                                'model.layers.16.self_attn.attn',
+                                                                'model.layers.17.self_attn.attn',
+                                                                'model.layers.18.self_attn.attn',
+                                                                'model.layers.19.self_attn.attn',
+                                                                'model.layers.20.self_attn.attn',
+                                                                'model.layers.21.self_attn.attn',
+                                                                'model.layers.22.self_attn.attn',
+                                                                'model.layers.23.self_attn.attn',
+                                                                'model.layers.24.self_attn.attn',
+                                                                'model.layers.25.self_attn.attn',
+                                                                'model.layers.26.self_attn.attn',
+                                                                'model.layers.27.self_attn.attn',
+                                                                'model.layers.28.self_attn.attn',
+                                                                'model.layers.29.self_attn.attn',
+                                                                'model.layers.30.self_attn.attn',
+                                                                'model.layers.31.self_attn.attn',
+                                                                'model.layers.32.self_attn.attn',
+                                                                'model.layers.33.self_attn.attn',
+                                                                'model.layers.34.self_attn.attn',
+                                                                'model.layers.35.self_attn.attn'],
+                    kv_cache_spec=AscendFullAttentionSpec(block_size=128,
+                                                            num_kv_heads=4,
+                                                            head_size=128,
+                                                            dtype=torch.bfloat16,
+                                                            use_mla=False,
+                                                            use_sfa=False,
+                                                            sliding_window=None,
+                                                            attention_chunk_size=None)
+                    )]
+            )
+        '''
+        logger.warning(f'===== KVCacheCoordinator构造函数中初创建BlockPool, kv_cache_config={kv_cache_config}')
         self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
                                     enable_kv_cache_events)
 

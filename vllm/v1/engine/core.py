@@ -80,7 +80,10 @@ class EngineCore:
         self.log_stats = log_stats
 
         # Setup Model.
+        # todo 这里很重要，executor_class就是 MultiprocExecutor，其构造函数中调用父类ExecutorBase，然后调用_init_executor()，启动worker进程，比如开启tp=2，则会启动2个worker进程，VLLM::Worker_TP0、VLLM::Worker_TP1
         self.model_executor = executor_class(vllm_config)
+        # ===== EngineCore constructor, Setup Model, self.model_executor=<vllm.v1.executor.multiproc_executor.MultiprocExecutor object at 0xfffced6c6b10>
+        logger.warning(f'===== EngineCore constructor, Setup Model, self.model_executor={self.model_executor}')
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(
                 executor_fail_callback)
@@ -90,9 +93,32 @@ class EngineCore:
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
             self._initialize_kv_caches(vllm_config)
+        logger.warning(f'===== EngineCore constructor, Setup KV Caches, num_gpu_blocks={num_gpu_blocks}, num_cpu_blocks={num_cpu_blocks}, kv_cache_config={kv_cache_config}')
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+        '''
+        一、上下文：KV Cache 与 Block Manager
+        在 vLLM 中：
+        
+        KV Cache 存储 attention 的 key/value，是推理时最耗显存的部分。
+        vLLM 使用 PagedAttention 技术，将 KV Cache 划分为固定大小的 block（块）。
+        这些 block 分为两类：
+        num_gpu_blocks：驻留在 GPU 显存中的块数量
+        num_cpu_blocks：可交换到 CPU 内存的块数量（用于 swap）
+        📌 这两个值是在 调度器（Scheduler） 根据 GPU 显存计算得出的，所有 TP Worker 必须使用相同的配置，否则会导致状态不一致或 crash。
+        
+        ✅ 二、collective_rpc("initialize_cache", ...) 的作用
+        🔹 功能
+        向所有参与张量并行（TP）的 Worker 进程广播 initialize_cache 命令，并传递 num_gpu_blocks 和 num_cpu_blocks 参数，让每个 Worker 同步初始化自己的 BlockManager 和 KV Cache 内存池。
+        
+        🔸 为什么需要“集体 RPC”？
+        当 --tensor-parallel-size N > 1 时，vLLM 会启动 N 个独立的 Worker 进程（每个 GPU 一个）。
+        主 Engine（如 AsyncLLMEngine）运行在单独的控制进程中（不加载模型）。
+        主进程不能直接访问 Worker 的内存，必须通过 IPC 通知它们执行操作。
+        initialize_cache 是一个 需要所有 Worker 协同完成的操作，因此使用 collective（集体）RPC。
+        '''
+        # 广播给所有worker执行 initialize_cache
         self.collective_rpc("initialize_cache",
                             args=(num_gpu_blocks, num_cpu_blocks))
 
@@ -121,6 +147,7 @@ class EngineCore:
             logger.info("Disabling chunked prefill for model without KVCache")
             vllm_config.scheduler_config.chunked_prefill_enabled = False
 
+        # Scheduler=<class 'vllm.v1.core.sched.scheduler.Scheduler'>
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
@@ -129,6 +156,11 @@ class EngineCore:
             > 1,
             log_stats=self.log_stats,
         )
+
+        logger.warning(
+            f'===== EngineCore constructor, 创建scheduler实例, Scheduler={Scheduler}, self.scheduler={self.scheduler}')
+        logger.warning(f'===== vllm_config={vllm_config}')
+
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(
@@ -166,12 +198,17 @@ class EngineCore:
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
 
+        # ===== EngineCore constructor, Setup step_fn, self.batch_queue=None, self.step_fn=<bound method EngineCore.step of <vllm.v1.engine.core.EngineCoreProc object at 0xfffce2d12350>>
+        logger.warning(f'===== EngineCore constructor, Setup step_fn, self.batch_queue={self.batch_queue}, self.step_fn={self.step_fn}')
+
+    # vllm pageattention并不是根据请求去分配实际的物理内存的，而是在初始化的时候就将系统空闲的内存都用作kv cache使用。
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
 
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
+        print(f'===== kv_cache_specs={kv_cache_specs}')
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
@@ -195,6 +232,8 @@ class EngineCore:
             available_gpu_memory = [0] * len(kv_cache_specs)
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
+
+        logger.warning(f'===== available_gpu_memory={available_gpu_memory}')
 
         kv_cache_configs = get_kv_cache_configs(vllm_config, kv_cache_specs,
                                                 available_gpu_memory)
@@ -240,6 +279,7 @@ class EngineCore:
             logger.warning("Got kv_transfer_params, but no KVConnector found. "
                            "Disabling KVTransfer for this request.")
 
+        logger.warning(f'==== 5.add req to scheduler, input_queue中到达请求，将请求放入scheduler中: self.scheduler.add_request(request)')
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):
@@ -269,12 +309,15 @@ class EngineCore:
                                   self.scheduler.make_stats())
             raise err
 
+    # self.step_fn()
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
+
+        logger.warning(f'===== 进入EngineCore.step()函数')
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
@@ -495,6 +538,7 @@ class EngineCoreProc(EngineCore):
 
             self._init_data_parallel(vllm_config)
 
+            # todo 调用父类 EngineCore 构造函数
             super().__init__(vllm_config, executor_class, log_stats,
                              executor_fail_callback)
 
@@ -504,12 +548,16 @@ class EngineCoreProc(EngineCore):
             # model forward pass.
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
             ready_event = threading.Event()
+            # todo EngineCoreProc构造函数中启动两个线程，input_thread 和 output_thread
+            logger.warning(f'===== 启动input_thread')
             input_thread = threading.Thread(target=self.process_input_sockets,
                                             args=(addresses.inputs,
                                                   addresses.coordinator_input,
                                                   identity, ready_event),
                                             daemon=True)
             input_thread.start()
+
+            logger.warning(f'===== 启动output_thread')
 
             self.output_thread = threading.Thread(
                 target=self.process_output_sockets,
@@ -657,12 +705,15 @@ class EngineCoreProc(EngineCore):
 
         return init_message.addresses
 
+    # todo EngineCoreProc子进程的入口函数
     @staticmethod
     def run_engine_core(*args,
                         dp_rank: int = 0,
                         local_dp_rank: int = 0,
                         **kwargs):
         """Launch EngineCore busy loop in background process."""
+
+        logger.warning(f'===== 进入EngineCoreProc子进程的入口函数run_engine_core, args={args}')
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
@@ -694,8 +745,10 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_rank_local = local_dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
-                set_process_title("EngineCore")
+                set_process_title("EngineCore")  # todo 设置进程名：VLLM::EngineCore
                 decorate_logs()
+                # todo EngineCoreProc实例化，启动两个线程
+                logger.warning(f'===== 在EngineCoreProc进程入口函数run_engine_core中，EngineCoreProc实例化，启动两个线程')
                 engine_core = EngineCoreProc(*args, **kwargs)
 
             engine_core.run_busy_loop()
@@ -723,9 +776,9 @@ class EngineCoreProc(EngineCore):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
-            self._process_input_queue()
+            self._process_input_queue()  # todo 这里就是检测input_queue中的请求，放入waiting队列
             # 2) Step the engine core and return the outputs.
-            self._process_engine_step()
+            self._process_engine_step()  # todo 调度请求（组batch），然后送给model推理
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -737,7 +790,8 @@ class EngineCoreProc(EngineCore):
                 logger.debug("EngineCore waiting for work.")
                 waited = True
             req = self.input_queue.get()
-            self._handle_client_request(*req)
+            logger.warning(f'===== self.input_queue.get()={req}')
+            self._handle_client_request(*req)  # 向scheduler的waiting队列添加请求
 
         if waited:
             logger.debug("EngineCore loop active.")
@@ -745,11 +799,13 @@ class EngineCoreProc(EngineCore):
         # Handle any more client requests.
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
-            self._handle_client_request(*req)
+            self._handle_client_request(*req)  # 向scheduler的waiting队列添加请求
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
+        # self.step_fn=<bound method EngineCore.step of <vllm.v1.engine.core.EngineCoreProc object at 0xfffd0f5529d0>>
+        logger.warning(f'===== EngineCoreProc中执行_process_engine_step, 调用self.step_fn, self.step_fn={self.step_fn}')
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
@@ -766,7 +822,7 @@ class EngineCoreProc(EngineCore):
 
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
-            self.add_request(req, request_wave)
+            self.add_request(req, request_wave)  # req加入waiting队列
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -876,6 +932,7 @@ class EngineCoreProc(EngineCore):
                     else:
                         request = generic_decoder.decode(data_frames)
 
+                    logger.warning(f'===== input_thread, request: socket -> input_queue')
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
 

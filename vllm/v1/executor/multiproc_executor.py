@@ -92,6 +92,7 @@ class MultiprocExecutor(Executor):
         try:
             for rank in range(self.world_size):
                 unready_workers.append(
+                    # todo 创建worker进程  VLLM::Worker_TP0、VLLM::Worker_TP1
                     WorkerProc.make_worker_process(
                         vllm_config=self.vllm_config,
                         local_rank=rank,
@@ -433,7 +434,7 @@ class WorkerProc:
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel)
 
-        # Load model
+        # Load model 加载模型
         self.worker.load_model()
 
     @staticmethod
@@ -462,12 +463,16 @@ class WorkerProc:
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
         }
+        # 创建worker进程
         # Run EngineCore busy loop in background process.
         proc = context.Process(target=WorkerProc.worker_main,
                                kwargs=process_kwargs,
                                name=f"VllmWorker-{rank}",
                                daemon=True)
 
+        logger.warning(f'===== WorkerProc.make_worker_process中创建并启动worker进程, proc={proc}')
+
+        # 启动worker进程
         proc.start()
         writer.close()
         # Keep death_writer open in parent - when parent exits,
@@ -521,6 +526,7 @@ class WorkerProc:
         destroy_model_parallel()
         destroy_distributed_environment()
 
+    # worker线程的执行体
     @staticmethod
     def worker_main(*args, **kwargs):
         """ Worker initialization and execution loops.
@@ -568,6 +574,7 @@ class WorkerProc:
 
         try:
             reader.close()
+            # 创建worker，
             worker = WorkerProc(*args, **kwargs)
 
             # Send READY once we know everything is loaded
@@ -696,6 +703,7 @@ class WorkerProc:
         if enable_ep:
             ep_rank = get_ep_group().rank_in_group
             process_name += f"_EP{ep_rank}"
+        logger.warning(f'===== 设置worker进程名称：{process_name}')
         set_process_title(name=process_name)
         decorate_logs(process_name)
 
@@ -723,4 +731,5 @@ def set_multiprocessing_worker_envs():
             "external environment to tune this value as needed.",
             current_parallelism, default_omp_num_threads)
         os.environ["OMP_NUM_THREADS"] = str(default_omp_num_threads)
+        # torch.set_num_threads(n) 是 PyTorch 提供的一个用于控制 CPU 并行计算线程数的函数，主要用于调节底层线性代数库（如 OpenMP、MKL、BLAS 等）在执行 CPU 张量运算时使用的线程数量。
         torch.set_num_threads(default_omp_num_threads)

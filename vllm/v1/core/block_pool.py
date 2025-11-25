@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 from typing import Any, Optional, Union
+import inspect
+import json
 
 from vllm.distributed.kv_events import (MEDIUM_GPU, AllBlocksCleared,
                                         BlockRemoved, BlockStored,
@@ -135,6 +137,131 @@ class BlockPool:
         enable_caching: bool,
         enable_kv_cache_events: bool = False,
     ):
+
+        """获取完整的调用栈"""
+        stack = inspect.stack()
+        stack_details = []
+
+        for frame_info in stack[1:]:  # 跳过当前函数
+            frame, filename, lineno, function, code_line, index = frame_info
+            stack_details.append({
+                'filename': filename,
+                'line_number': lineno,
+                'function': function,
+                'code_line': code_line
+            })
+        # logger.warning(f'===== all stack_details={stack_details}')
+        logger.warning(f'===== BlockPool all stack_details={json.dumps(stack_details, indent=4)}')
+
+        '''
+            [
+                {
+                    "filename": "/home/liudi/vllm/vllm/v1/core/kv_cache_coordinator.py",
+                    "line_number": 122,
+                    "function": "__init__",
+                    "code_line": [
+                        "        self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,\n"
+                    ]
+                },
+                {
+                    "filename": "/home/liudi/vllm/vllm/v1/core/kv_cache_coordinator.py",
+                    "line_number": 325,
+                    "function": "__init__",
+                    "code_line": [
+                        "        super().__init__(kv_cache_config,\n"
+                    ]
+                },
+                {
+                    "filename": "/home/liudi/vllm/vllm/v1/core/kv_cache_coordinator.py",
+                    "line_number": 518,
+                    "function": "get_kv_cache_coordinator",
+                    "code_line": [
+                        "        return UnitaryKVCacheCoordinator(kv_cache_config,\n"
+                    ]
+                },
+                {
+                    "filename": "/home/liudi/vllm/vllm/v1/core/kv_cache_manager.py",
+                    "line_number": 218,
+                    "function": "__init__",
+                    "code_line": [
+                        "        self.coordinator = get_kv_cache_coordinator(\n"
+                    ]
+                },
+                {
+                    "filename": "/home/liudi/vllm/vllm/v1/core/sched/scheduler.py",
+                    "line_number": 173,
+                    "function": "__init__",
+                    "code_line": [
+                        "        self.kv_cache_manager = KVCacheManager(\n"
+                    ]
+                },
+                {
+                    "filename": "/home/liudi/vllm/vllm/v1/engine/core.py",
+                    "line_number": 150,
+                    "function": "__init__",
+                    "code_line": [
+                        "        self.scheduler: SchedulerInterface = Scheduler(\n"
+                    ]
+                },
+                {
+                    "filename": "/home/liudi/vllm/vllm/v1/engine/core.py",
+                    "line_number": 538,
+                    "function": "__init__",
+                    "code_line": [
+                        "            super().__init__(vllm_config, executor_class, log_stats,\n"
+                    ]
+                },
+                {
+                    "filename": "/home/liudi/vllm/vllm/v1/engine/core.py",
+                    "line_number": 748,
+                    "function": "run_engine_core",
+                    "code_line": [
+                        "                engine_core = EngineCoreProc(*args, **kwargs)\n"
+                    ]
+                },
+                {
+                    "filename": "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py",
+                    "line_number": 108,
+                    "function": "run",
+                    "code_line": [
+                        "            self._target(*self._args, **self._kwargs)\n"
+                    ]
+                },
+                {
+                    "filename": "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py",
+                    "line_number": 314,
+                    "function": "_bootstrap",
+                    "code_line": [
+                        "                self.run()\n"
+                    ]
+                },
+                {
+                    "filename": "/usr/local/python3.11.13/lib/python3.11/multiprocessing/spawn.py",
+                    "line_number": 135,
+                    "function": "_main",
+                    "code_line": [
+                        "    return self._bootstrap(parent_sentinel)\n"
+                    ]
+                },
+                {
+                    "filename": "/usr/local/python3.11.13/lib/python3.11/multiprocessing/spawn.py",
+                    "line_number": 122,
+                    "function": "spawn_main",
+                    "code_line": [
+                        "    exitcode = _main(fd, parent_sentinel)\n"
+                    ]
+                },
+                {
+                    "filename": "<string>",
+                    "line_number": 1,
+                    "function": "<module>",
+                    "code_line": null
+                }
+            ]
+        '''
+
+
+        # 如上打印的堆栈信息，BlockPool创建调用栈：EngineCore进程的主线程中，EngineCoreProc初始化 -> EngineCore初始化 -> Scheduler初始化 -> KVCacheManager初始化 -> UnitaryKVCacheCoordinator初始化 -> BlockPool初始化
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching

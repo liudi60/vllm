@@ -70,6 +70,7 @@ class Executor(ExecutorBase):
         Initialize the KV caches and begin the model execution loop of the
         underlying workers.
         """
+        print(f"===== Executor.initialize_from_config")
         self.collective_rpc("initialize_from_config",
                             args=(kv_cache_configs, ))
         self.collective_rpc("compile_or_warm_up_model")

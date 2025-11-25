@@ -230,6 +230,8 @@ class SchedulerConfig:
             self.scheduler_cls = (
                 "vllm.v1.core.sched.async_scheduler.AsyncScheduler")
 
+        logger.info(f'===== self.scheduler_cls={self.scheduler_cls}')
+
     @model_validator(mode='after')
     def _verify_args(self) -> Self:
         if (self.max_num_batched_tokens < self.max_model_len

@@ -157,17 +157,281 @@ async def build_async_engine_client(
     client_config: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[EngineClient]:
 
+    # ===== os.getenv("VLLM_WORKER_MULTIPROC_METHOD")=spawn
+    logger.warning(f'===== os.getenv("VLLM_WORKER_MULTIPROC_METHOD")={os.getenv("VLLM_WORKER_MULTIPROC_METHOD")}')
+
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
         # Pre-import heavy modules in the forkserver process
         logger.debug("Setup forkserver with pre-imports")
+
+        # 这段代码是 Python 多进程（multiprocessing） 中用于配置和启动 forkserver 启动方法（start method） 的典型用法，
+        # 常见于高性能推理框架（如 vLLM）中，目的是在多进程环境下安全、高效地加载大型模型（如 LLM）。
+
+        # forkserver 的优势：
+        # 主进程先加载好模型等大对象 → 启动 forkserver
+        # 后续子进程通过 forkserver fork 出来 → 共享已加载的模型内存（写时复制）
+        # 避免每个子进程重复加载大模型（节省内存 + 加速启动）
+
+        # 正确做法：
+        # 在设置 forkserver 后、启动它之前，预加载所有子进程会用到的重型模块（尤其是包含大模型、CUDA 上下文的模块）。
+        # 💡 这样，当子进程 fork 出来时，这些模块已经存在于内存中，可直接使用，且与主进程共享（只读部分）。
+
+        # 1. 设置 Python 多进程的 启动方式（start method）为 'forkserver'。
         multiprocessing.set_start_method('forkserver')
+
+        # 2. 预先导入指定模块到 forkserver 进程中。
+        # 为什么需要？
+        # forkserver 是一个独立的轻量级进程。
+        # 默认情况下，它只导入了基本模块。
+        # 如果子进程需要用到 vllm.v1.engine.async_llm，而 forkserver 没有预加载它：
+        # 子进程 fork 后仍需自己导入 → 失去“共享内存”优势
+        # 可能因导入顺序/状态不一致导致错误
         multiprocessing.set_forkserver_preload(["vllm.v1.engine.async_llm"])
+
+        # 3. 显式启动 forkserver 进程（如果尚未运行）。
+        # 背景：
+        # forkserver 不会在 set_start_method 时立即启动。
+        # 它通常在第一次创建子进程时才懒启动。
+        # 但某些场景（如 vLLM）希望提前控制 forkserver 的启动时机，例如：
+        # 在主进程完成模型加载后立即启动 forkserver
+        # 确保 forkserver 继承的是“干净且已初始化”的状态
+        # ✅ 手动调用 ensure_running() 可以：
+        # 精确控制 forkserver 的启动时间点
+        # 避免在后续并发创建子进程时竞争启动
+        # 确保 forkserver 继承的是预期的内存状态（如已加载的 PyTorch 模型、CUDA context）
+        # 📌 注意：forkserver 是 multiprocessing 的内部模块，通常通过：from multiprocessing import forkserver
         forkserver.ensure_running()
+
+        # 整体逻辑（以 vLLM 为例）
+        # 主进程：
+        # 加载大语言模型（LLM）到 GPU 内存（耗时、占内存）
+        # 设置多进程启动方式为 forkserver
+        # 预加载 async_llm 模块（包含模型引用）
+        # 立即启动 forkserver → 此时 forkserver 进程继承了已加载的模型（通过写时复制共享）
+        # 后续创建子进程（worker）：
+        # 通过 forkserver fork 出来
+        # 子进程无需重新加载模型，直接访问共享内存中的模型
+        # 实现 低内存开销 + 快速 worker 启动
+
         logger.debug("Forkserver setup complete!")
 
     # Context manager to handle engine_client lifecycle
     # Ensures everything is shutdown and cleaned up on error/exit
+    '''
+    ===== 通过args创建engine_args,
+    args=Namespace(model_tag=None,
+    headless=False,
+    api_server_count=1,
+    config=None,
+    host=None,
+    port=8000,
+    uds=None,
+    uvicorn_log_level='info',
+    disable_uvicorn_access_log=False,
+    allow_credentials=False,
+    allowed_origins=['*'],
+    allowed_methods=['*'],
+    allowed_headers=['*'],
+    api_key=None,
+    lora_modules=None,
+    chat_template=None,
+    chat_template_content_format='auto',
+    trust_request_chat_template=False,
+    response_role='assistant',
+    ssl_keyfile=None,
+    ssl_certfile=None,
+    ssl_ca_certs=None,
+    enable_ssl_refresh=False,
+    ssl_cert_reqs=0,
+    root_path=None,
+    middleware=[],
+    return_tokens_as_token_ids=False,
+    disable_frontend_multiprocessing=False,
+    enable_request_id_headers=False,
+    enable_auto_tool_choice=False,
+    exclude_tools_when_tool_choice_none=False,
+    tool_call_parser=None,
+    tool_parser_plugin='',
+    tool_server=None,
+    log_config_file=None,
+    max_log_len=None,
+    disable_fastapi_docs=False,
+    enable_prompt_tokens_details=False,
+    enable_server_load_tracking=False,
+    enable_force_include_usage=False,
+    enable_tokenizer_info_endpoint=False,
+    enable_log_outputs=False,
+    h11_max_incomplete_event_size=4194304,
+    h11_max_header_count=256,
+    log_error_stack=False,
+    model='Qwen3-8B-W8A8',
+    runner='auto',
+    convert='auto',
+    task=None,
+    tokenizer=None,
+    tokenizer_mode='auto',
+    trust_remote_code=True,
+    dtype='auto',
+    seed=None,
+    hf_config_path=None,
+    allowed_local_media_path='',
+    allowed_media_domains=None,
+    revision=None,
+    code_revision=None,
+    rope_scaling={},
+    rope_theta=None,
+    tokenizer_revision=None,
+    max_model_len=22528,
+    quantization=None,
+    enforce_eager=True,
+    max_logprobs=20,
+    logprobs_mode='raw_logprobs',
+    disable_sliding_window=False,
+    disable_cascade_attn=False,
+    skip_tokenizer_init=False,
+    enable_prompt_embeds=False,
+    served_model_name=['qwen3_moe'],
+    config_format='auto',
+    hf_token=None,
+    hf_overrides={},
+    pooler_config=None,
+    override_pooler_config=None,
+    logits_processor_pattern=None,
+    generation_config='auto',
+    override_generation_config={},
+    enable_sleep_mode=False,
+    model_impl='auto',
+    override_attention_dtype=None,
+    logits_processors=None,
+    io_processor_plugin=None,
+    load_format='auto',
+    download_dir=None,
+    safetensors_load_strategy='lazy',
+    model_loader_extra_config={},
+    ignore_patterns=None,
+    use_tqdm_on_load=True,
+    pt_load_map_location='cpu',
+    reasoning_parser='',
+    guided_decoding_backend=None,
+    guided_decoding_disable_fallback=None,
+    guided_decoding_disable_any_whitespace=None,
+    guided_decoding_disable_additional_properties=None,
+    distributed_executor_backend='mp',
+    pipeline_parallel_size=1,
+    tensor_parallel_size=2,
+    decode_context_parallel_size=1,
+    data_parallel_size=1,
+    data_parallel_rank=None,
+    data_parallel_start_rank=None,
+    data_parallel_size_local=None,
+    data_parallel_address=None,
+    data_parallel_rpc_port=None,
+    data_parallel_backend='mp',
+    data_parallel_hybrid_lb=False,
+    enable_expert_parallel=False,
+    enable_dbo=False,
+    dbo_decode_token_threshold=32,
+    dbo_prefill_token_threshold=512,
+    enable_eplb=False,
+    eplb_config=EPLBConfig(window_size=1000,
+    step_interval=3000,
+    num_redundant_experts=0,
+    log_balancedness=False),
+    expert_placement_strategy='linear',
+    num_redundant_experts=None,
+    eplb_window_size=None,
+    eplb_step_interval=None,
+    eplb_log_balancedness=None,
+    max_parallel_loading_workers=None,
+    ray_workers_use_nsight=False,
+    disable_custom_all_reduce=False,
+    worker_cls='auto',
+    worker_extension_cls='',
+    enable_multimodal_encoder_data_parallel=False,
+    block_size=None,
+    gpu_memory_utilization=0.9,
+    kv_cache_memory_bytes=None,
+    swap_space=4,
+    kv_cache_dtype='auto',
+    num_gpu_blocks_override=None,
+    enable_prefix_caching=None,
+    prefix_caching_hash_algo='sha256',
+    cpu_offload_gb=0,
+    calculate_kv_scales=False,
+    kv_sharing_fast_prefill=False,
+    mamba_cache_dtype='auto',
+    mamba_ssm_cache_dtype='auto',
+    limit_mm_per_prompt={},
+    media_io_kwargs={},
+    mm_processor_kwargs=None,
+    mm_processor_cache_gb=4,
+    disable_mm_preprocessor_cache=False,
+    mm_processor_cache_type='lru',
+    mm_shm_cache_max_object_size_mb=128,
+    mm_encoder_tp_mode='weights',
+    interleave_mm_strings=False,
+    skip_mm_profiling=False,
+    video_pruning_rate=None,
+    enable_lora=None,
+    enable_lora_bias=False,
+    max_loras=1,
+    max_lora_rank=16,
+    lora_extra_vocab_size=256,
+    lora_dtype='auto',
+    max_cpu_loras=None,
+    fully_sharded_loras=False,
+    default_mm_loras=None,
+    show_hidden_metrics_for_version=None,
+    otlp_traces_endpoint=None,
+    collect_detailed_traces=None,
+    max_num_batched_tokens=None,
+    max_num_seqs=768,
+    max_num_partial_prefills=1,
+    max_long_partial_prefills=1,
+    cuda_graph_sizes=[],
+    long_prefill_token_threshold=0,
+    num_lookahead_slots=0,
+    scheduling_policy='sjf',
+    enable_chunked_prefill=None,
+    disable_chunked_mm_input=False,
+    scheduler_cls='vllm.core.scheduler.Scheduler',
+    disable_hybrid_kv_cache_manager=False,
+    async_scheduling=False,
+    speculative_config=None,
+    kv_transfer_config=None,
+    kv_events_config=None,
+    compilation_config={"level":null,
+                        "debug_dump_path":"",
+                        "cache_dir":"",
+                        "backend":"",
+                        "custom_ops":[],
+                        "splitting_ops":null,
+                        "use_inductor":true,
+                        "compile_sizes":null,
+                        "inductor_compile_config":{"enable_auto_functionalized_v2":false},
+                        "inductor_passes":{},
+                        "cudagraph_mode":null,
+                        "use_cudagraph":true,
+                        "cudagraph_num_of_warmups":0,
+                        "cudagraph_capture_sizes":[1],
+                        "cudagraph_copy_inputs":false,
+                        "full_cuda_graph":false,
+                        "use_inductor_graph_partition":false,
+                        "pass_config":{},
+                        "max_capture_size":null,
+                        "local_cache_dir":null},
+    additional_config={},
+    structured_outputs_config=StructuredOutputsConfig(backend='auto',
+                                                    disable_fallback=False,
+                                                    disable_any_whitespace=False,
+                                                    disable_additional_properties=False,
+                                                    reasoning_parser=''),
+                                                    disable_log_stats=False,
+                                                    enable_log_requests=False,
+                                                    disable_log_requests=True)
+    '''
+    logger.warning(f'===== 通过args创建engine_args, args={args}')
     engine_args = AsyncEngineArgs.from_cli_args(args)
     if client_config:
         engine_args._api_process_count = client_config.get("client_count", 1)
@@ -202,8 +466,13 @@ async def build_async_engine_client_from_engine_args(
     Returns the Client or None if the creation failed.
     """
 
+    logger.warning(f'===== aip_server.py中 build_async_engine_client_from_engine_args')
+
     # Create the EngineConfig (determines if we can use V1).
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+
+    # vllm_config里面包含了各种config
+    logger.warning(f'===== vllm_config={vllm_config}')
 
     # V1 AsyncLLM.
     assert envs.VLLM_USE_V1
@@ -222,6 +491,7 @@ async def build_async_engine_client_from_engine_args(
     client_index = client_config.pop("client_index", 0)
 
     try:
+        logger.warning(f'===== AsyncLLM.from_vllm_config构造AsyncLLM实例')
         async_llm = AsyncLLM.from_vllm_config(
             vllm_config=vllm_config,
             usage_context=usage_context,
@@ -1899,6 +2169,7 @@ async def run_server_worker(listen_address,
     if log_config is not None:
         uvicorn_kwargs['log_config'] = log_config
 
+    # todo 启动worker进程？
     async with build_async_engine_client(
             args,
             client_config=client_config,
@@ -1912,6 +2183,7 @@ async def run_server_worker(listen_address,
         logger.info("Starting vLLM API server %d on %s",
                     vllm_config.parallel_config._api_process_rank,
                     listen_address)
+        # todo 启动http服务
         shutdown_task = await serve_http(
             app,
             sock=sock,
@@ -1948,6 +2220,7 @@ if __name__ == "__main__":
         description="vLLM OpenAI-Compatible RESTful API server.")
     parser = make_arg_parser(parser)
     args = parser.parse_args()
+    logger.warning(f'===== 启动服务, args={args}')
     validate_parsed_serve_args(args)
 
     uvloop.run(run_server(args))

@@ -390,6 +390,8 @@ class LLM:
         lora_request = self._get_modality_specific_lora_reqs(
             prompts, lora_request)
 
+        logger.warning(f'===== class LLM generate self._validate_and_add_requests, prompts={prompts}, lora_request={lora_request}')
+
         self._validate_and_add_requests(
             prompts=prompts,
             params=sampling_params,
@@ -1001,6 +1003,8 @@ class LLM:
             # obtain the actual model prompts from the pre-processor
             prompts = self.io_processor.pre_process(prompt=validated_prompt)
 
+        logger.warning(f'===== class LLM encode self._validate_and_add_requests, prompts={prompts}, lora_request={lora_request}')
+
         self._validate_and_add_requests(
             prompts=prompts,
             params=pooling_params,
@@ -1253,6 +1257,8 @@ class LLM:
                 pooling_params_list.append(pooling_params)
 
             prompts.append(engine_prompt)
+
+        logger.warning(f'===== class LLM _cross_encoding_score self._validate_and_add_requests, prompts={prompts}, lora_request={lora_request}')
 
         self._validate_and_add_requests(
             prompts=prompts,

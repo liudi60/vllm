@@ -1113,6 +1113,9 @@ class EngineArgs:
         usage_context: Optional[UsageContext] = None,
         headless: bool = False,
     ) -> VllmConfig:
+
+        logger.warning(f'===== EngineArgs.create_engine_config 创建VllmConfig实例')
+
         """
         Create the VllmConfig.
 
@@ -1140,6 +1143,7 @@ class EngineArgs:
              vllm_speculative_config=self.speculative_config,
          )
         model_config = self.create_model_config()
+        logger.warning(f'===== model_config={model_config}')
 
         # * If VLLM_USE_V1 is unset, we enable V1 for "supported features"
         #   and fall back to V0 for experimental or unsupported features.
@@ -1204,6 +1208,8 @@ class EngineArgs:
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
         )
+
+        logger.warning(f'===== cache_config={cache_config}')
 
         ray_runtime_env = None
         if is_ray_initialized():
@@ -1344,12 +1350,16 @@ class EngineArgs:
             _api_process_rank=self._api_process_rank,
         )
 
+        logger.warning(f'===== parallel_config={parallel_config}')
+
         speculative_config = self.create_speculative_config(
             target_model_config=model_config,
             target_parallel_config=parallel_config,
             enable_chunked_prefill=self.enable_chunked_prefill,
             disable_log_stats=self.disable_log_stats,
         )
+
+        logger.warning(f'===== speculative_config={speculative_config}')
 
         # make sure num_lookahead_slots is set appropriately depending on
         # whether speculative decoding is enabled
@@ -1378,6 +1388,8 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
         )
+
+        logger.warning(f'===== 创建scheduler_config, scheduler_config={scheduler_config}')
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
             raise ValueError(

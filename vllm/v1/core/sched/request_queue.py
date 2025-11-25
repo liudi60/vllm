@@ -85,7 +85,7 @@ class FCFSRequestQueue(deque[Request], RequestQueue):
 
     def add_request(self, request: Request) -> None:
         """Add a request to the queue according to FCFS policy."""
-        self.append(request)
+        self.append(request)  # 右侧添加
 
     def pop_request(self) -> Request:
         """Pop a request from the queue according to FCFS policy."""

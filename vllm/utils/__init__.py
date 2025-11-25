@@ -3454,6 +3454,7 @@ def set_process_title(name: str,
     """
     if suffix:
         name = f"{name}_{suffix}"
+    logger.warning(f'===== 设置进程名：{prefix}::{name}')
     setproctitle.setproctitle(f"{prefix}::{name}")
 
 

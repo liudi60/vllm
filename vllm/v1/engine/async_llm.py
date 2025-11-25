@@ -134,6 +134,7 @@ class AsyncLLM(EngineClient):
                 self.observability_config.otlp_traces_endpoint)
             self.output_processor.tracer = tracer
 
+        logger.warning(f'===== AsyncLLM中调用EngineCoreClient.make_async_mp_client')
         # EngineCore (starts the engine in background process).
         self.engine_core = EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,

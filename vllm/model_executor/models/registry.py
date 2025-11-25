@@ -580,7 +580,7 @@ class _ModelRegistry:
 
         if model_arch in self.models:
             logger.warning(
-                "Model architecture %s is already registered, and will be "
+                "===== Model architecture %s is already registered, and will be "
                 "overwritten by the new model class %s.", model_arch,
                 model_cls)
 

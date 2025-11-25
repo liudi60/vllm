@@ -82,6 +82,6 @@ class TimeAndLengthScorer(NormalizedScorer):
  
  
     print("-" * 50)
-    for t, l in test_cases:
-        s = scorer.score(t, l)
-        print(f"time:{t}, len:{l}, score:{s:.3f}")
+    # for t, l in test_cases:
+    #     s = scorer.score(t, l)
+    #     print(f"time:{t}, len:{l}, score:{s:.3f}")
