@@ -129,6 +129,7 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self._reserved_blocks_in_use_request_id = None
 
     @property
     def usage(self) -> float:
@@ -189,6 +190,49 @@ class KVCacheManager:
             self.prefix_cache_stats.hits += num_new_computed_tokens
 
         return KVCacheBlocks(computed_blocks), num_new_computed_tokens
+
+    def _reset_reserved_blocks_in_use_request_id(self, request_id:str):
+        if self._reserved_blocks_in_use_request_id == request_id:
+            logger.warning(f'===== KVCacheManager reset_reserved_blocks_in_use_request_id, request_id={request_id}')
+            self._reserved_blocks_in_use_request_id = None
+
+    def _is_blocks_sufficient(self, request: Request, num_blocks_to_allocate: int) -> bool:
+        # 此段只判断一个逻辑：空闲块是否够用
+        # todo 111 此处判断reserve_block_num
+        logger.warning(
+            f'===== KVCacheManager.allocate_slots, reserved_block_num={self.kv_cache_config.reserved_block_num}')
+        if request.num_computed_tokens == 0:  # prefill、preempt 新请求，强制预留block (特性未开启，即 self.kv_cache_config.reserved_block_num=0)
+            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks() - self.kv_cache_config.reserved_block_num:
+                logger.warning(f'===== _is_blocks_sufficient 1, prefill, normal blocks insufficient')
+                # Cannot allocate new blocks
+                return False
+        else:  # resume、decode、chunk-prefill 请求
+            if self._reserved_blocks_in_use_request_id is not None:  # self._reserved_blocks_in_use_request_id 不为None，说明预留块正在被使用（注：只分给1个request_id）
+                if self._reserved_blocks_in_use_request_id == request.request_id:  # 同一请求，可继续使用预留块
+                    if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+                        logger.warning(f'===== _is_blocks_sufficient 5, decode, reserved in use, same request, reserved blocks insufficient')
+                        return False
+                    else:
+                        logger.warning(f'===== _is_blocks_sufficient 6, decode, reserved in use, same request, reserved blocks allocated')
+                else:
+                    # 此处，非同一请求，按正常块分配即可。考虑到抢占后，重新分配，所以不能直接 return False，而是需要再按正常块分配一次。
+                    if num_blocks_to_allocate > self.block_pool.get_num_free_blocks() - self.kv_cache_config.reserved_block_num:
+                        logger.warning(f'===== _is_blocks_sufficient 7, decode, reserved in use, not same request, normal blocks insufficient')
+                        # Cannot allocate new blocks
+                        return False
+                    else:
+                        logger.warning(f'===== _is_blocks_sufficient 8, decode, reserved in use, not same request, normal blocks allocated')
+            else:  # 预留块没有被使用
+                # self._reserved_blocks_in_use_request_id = request.request_id
+                if num_blocks_to_allocate > self.block_pool.get_num_free_blocks() - self.kv_cache_config.reserved_block_num:  # 先按正常块分。正常块不够了
+                    logger.warning(f'===== _is_blocks_sufficient 2, decode, normal blocks insufficient')
+                    if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():  # 要尝试加上预留块。加上预留块也不够，则返回None
+                        logger.warning(f'===== _is_blocks_sufficient 3, decode, reserved blocks insufficient')
+                        return False
+                    else:  # 加上预留块就够了，则设置 request_id。todo _reserved_blocks_in_use_request_id 何时设置None？在KVCacheManager.free(request)中设置为None，free函数在一个请求推理结束时调用。
+                        logger.warning(f'===== _is_blocks_sufficient 4, decode, reserved blocks allocated')
+                        self._reserved_blocks_in_use_request_id = request.request_id
+        return True
 
     def allocate_slots(
         self,
@@ -268,7 +312,7 @@ class KVCacheManager:
             num_encoder_tokens=num_encoder_tokens,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+        if not self._is_blocks_sufficient(request, num_blocks_to_allocate):
             # Cannot allocate new blocks
             return None
 
@@ -311,6 +355,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self._reset_reserved_blocks_in_use_request_id(request.request_id)
         self.coordinator.free(request.request_id)
 
     def reset_prefix_cache(self) -> bool:

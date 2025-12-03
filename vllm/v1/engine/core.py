@@ -209,6 +209,9 @@ class EngineCore:
         elapsed = time.time() - start
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
+        logger.warning(f'===== _initialize_kv_caches, scheduler_kv_cache_config={scheduler_kv_cache_config}')
+        logger.warning(f'===== vllm_config.cache_config={vllm_config.cache_config}')
+        scheduler_kv_cache_config.reserved_block_num = vllm_config.cache_config.reserved_block_num
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:

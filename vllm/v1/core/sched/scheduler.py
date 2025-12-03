@@ -186,6 +186,24 @@ class Scheduler(SchedulerInterface):
 
         self.chunked_prefill_tail_optimization_factor = vllm_config.additional_config.get("chunked_prefill_tail_optimization_factor", 1)
 
+    # 计算一个prefill请求在组batch时需要等待的时间（单位：ms），可以立即组batch时，返回0
+    def _compute_prefill_request_pending_delay_ms(self, scheduled_new_reqs: list[Request], req: Request,
+                                                  token_budget: int) -> int:
+        logger.warning(
+            f'===== compute_prefill_request_pending_delay_ms, req={req}, \n vllm_config={self.vllm_config}, \n kv_cache_config={self.kv_cache_config}')
+        logger.warning(
+            f'===== self.min_prefill_batch_size={self.min_prefill_batch_size}, self.prefill_request_batching_timeout_ms={self.prefill_request_batching_timeout_ms}, self.scheduler_delay_us={self.scheduler_delay_us}')
+        # prefill请求包括：running队列中的chunk-prefill请求、waiting队列中的新请求、waiting队列中preempted请求（由于次判断在 not preempted_reqs 下，所以不用考虑此情况）
+        # prefill 组batch时，对于每个请求的判断逻辑：
+        # 只有当prefill_batch_size没达到min_prefill_batch_size，并且当前请求没有超时，这两个条件下，才会sleep，其他情况均放行
+
+        # 是否sleep？对。ibis中使用的 scheduler_cv_.wait_for(lock, timeout)；
+        if (len(scheduled_new_reqs) < self.scheduler_config.min_prefill_batch_size
+                and (
+                        time.time() - req.arrival_time) * 1000 < self.scheduler_config.prefill_request_batching_timeout_ms):  # 统一用ms计算
+            return self.scheduler_config.scheduler_delay_us
+
+        return 0
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:

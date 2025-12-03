@@ -356,6 +356,7 @@ class EngineArgs:
     cpu_offload_gb: float = CacheConfig.cpu_offload_gb
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: Optional[int] = CacheConfig.kv_cache_memory_bytes
+    reserved_block_num: Optional[int] = CacheConfig.reserved_block_num
     max_num_batched_tokens: Optional[
         int] = SchedulerConfig.max_num_batched_tokens
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
@@ -784,6 +785,8 @@ class EngineArgs:
                                  **cache_kwargs["mamba_cache_dtype"])
         cache_group.add_argument("--mamba-ssm-cache-dtype",
                                  **cache_kwargs["mamba_ssm_cache_dtype"])
+        cache_group.add_argument("--reserved-block-num",
+                                 **cache_kwargs["reserved_block_num"])
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)
@@ -1203,6 +1206,7 @@ class EngineArgs:
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
+            reserved_block_num=self.reserved_block_num,
         )
 
         ray_runtime_env = None
