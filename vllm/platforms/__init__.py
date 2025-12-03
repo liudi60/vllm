@@ -179,7 +179,20 @@ builtin_platform_plugins = {
 
 
 def resolve_current_platform_cls_qualname() -> str:
+
     platform_plugins = load_plugins_by_group('vllm.platform_plugins')
+
+    # ===== platform_plugins={'ascend': <function register at 0xfffda771cf40>}
+    logger.warning(f'===== platform_plugins={platform_plugins}')
+
+    # 获取vllm-ascend插件定义入口路径
+    import inspect
+    ascend_func = platform_plugins['ascend']
+    file_path = inspect.getsourcefile(ascend_func)  # 获取函数定义所在的文件路径
+    line_no = inspect.getsourcelines(ascend_func)[1]  # 返回 (lines, lineno)
+    # ===== ascend_func file_path=/vllm-workspace/vllm-ascend/vllm_ascend/__init__.py, fun_name=register, line_no=19
+    logger.warning(f'===== ascend_func file_path={file_path}, fun_name={ascend_func.__name__}, line_no={line_no}')
+
 
     activated_plugins = []
 
@@ -187,6 +200,16 @@ def resolve_current_platform_cls_qualname() -> str:
                             platform_plugins.items()):
         try:
             assert callable(func)
+            '''
+            
+            ===== platform_plugins, fun=<function tpu_platform_plugin at 0xfffda76ed440>
+            ===== platform_plugins, fun=<function cuda_platform_plugin at 0xfffda76ed580>
+            ===== platform_plugins, fun=<function rocm_platform_plugin at 0xfffda76ed8a0>
+            ===== platform_plugins, fun=<function xpu_platform_plugin at 0xfffda771cc20>
+            ===== platform_plugins, fun=<function cpu_platform_plugin at 0xfffda771ccc0>
+            ===== platform_plugins, fun=<function register at 0xfffda771cf40>    # 这个就是ascend 
+            '''
+            logger.warning(f'===== platform_plugins, fun={func}')
             platform_cls_qualname = func()
             if platform_cls_qualname is not None:
                 activated_plugins.append(name)
@@ -204,6 +227,7 @@ def resolve_current_platform_cls_qualname() -> str:
             f"{activated_oot_plugins}")
     elif len(activated_oot_plugins) == 1:
         platform_cls_qualname = platform_plugins[activated_oot_plugins[0]]()
+        logger.warning(f'===== platform_cls_qualname={platform_cls_qualname}')  # vllm_ascend.platform.NPUPlatform
         logger.info("Platform plugin %s is activated",
                     activated_oot_plugins[0])
     elif len(activated_builtin_plugins) >= 2:
@@ -229,6 +253,7 @@ if TYPE_CHECKING:
     current_platform: Platform
 
 
+# 通过 __getattr__ 实现模块的懒加载
 def __getattr__(name: str):
     if name == 'current_platform':
         # lazy init current_platform.
@@ -244,6 +269,132 @@ def __getattr__(name: str):
         #    see the test failures).
         global _current_platform
         if _current_platform is None:
+
+            """获取完整的调用栈"""
+            import inspect
+            import json
+            stack = inspect.stack()
+            stack_details = []
+
+            for frame_info in stack[1:]:  # 跳过当前函数
+                frame, filename, lineno, function, code_line, index = frame_info
+                stack_details.append({
+                    'filename': filename,
+                    'line_number': lineno,
+                    'function': function,
+                    'code_line': code_line
+                })
+            # logger.warning(f'===== all stack_details={stack_details}')
+            logger.warning(f'===== platforms all stack_details={json.dumps(stack_details, indent=4)}')
+            '''
+            ===== platforms all stack_details=[
+            {
+                "filename": "<frozen importlib._bootstrap>",
+                "line_number": 1229,
+                "function": "_handle_fromlist",
+                "code_line": null
+            },
+            {
+                "filename": "/home/liudi/vllm/vllm/config/lora.py",
+                "line_number": 14,
+                "function": "<module>",
+                "code_line": [
+                    "from vllm.platforms import current_platform\n"
+                ]
+            },
+            {
+                "filename": "<frozen importlib._bootstrap>",
+                "line_number": 241,
+                "function": "_call_with_frames_removed",
+                "code_line": null
+            },
+            {
+                "filename": "<frozen importlib._bootstrap_external>",
+                "line_number": 940,
+                "function": "exec_module",
+                "code_line": null
+            },
+            {
+                "filename": "<frozen importlib._bootstrap>",
+                "line_number": 690,
+                "function": "_load_unlocked",
+                "code_line": null
+            },
+            {
+                "filename": "<frozen importlib._bootstrap>",
+                "line_number": 1147,
+                "function": "_find_and_load_unlocked",
+                "code_line": null
+            },
+            {
+                "filename": "<frozen importlib._bootstrap>",
+                "line_number": 1176,
+                "function": "_find_and_load",
+                "code_line": null
+            },
+            {
+                "filename": "/home/liudi/vllm/vllm/config/__init__.py",
+                "line_number": 34,
+                "function": "<module>",
+                "code_line": [
+                    "from vllm.config.lora import LoRAConfig\n"
+                ]
+            },
+            {
+                "filename": "<frozen importlib._bootstrap>",
+                "line_number": 241,
+                "function": "_call_with_frames_removed",
+                "code_line": null
+            },
+            {
+                "filename": "<frozen importlib._bootstrap_external>",
+                "line_number": 940,
+                "function": "exec_module",
+                "code_line": null
+            },
+            {
+                "filename": "<frozen importlib._bootstrap>",
+                "line_number": 690,
+                "function": "_load_unlocked",
+                "code_line": null
+            },
+            {
+                "filename": "<frozen importlib._bootstrap>",
+                "line_number": 1147,
+                "function": "_find_and_load_unlocked",
+                "code_line": null
+            },
+            {
+                "filename": "<frozen importlib._bootstrap>",
+                "line_number": 1176,
+                "function": "_find_and_load",
+                "code_line": null
+            },
+            {
+                "filename": "/home/liudi/vllm/vllm/entrypoints/openai/api_server.py",
+                "line_number": 43,
+                "function": "<module>",
+                "code_line": [
+                    "from vllm.config import VllmConfig\n"
+                ]
+            },
+            {
+                "filename": "<frozen runpy>",
+                "line_number": 88,
+                "function": "_run_code",
+                "code_line": null
+            },
+            {
+                "filename": "<frozen runpy>",
+                "line_number": 198,
+                "function": "_run_module_as_main",
+                "code_line": null
+            }
+        ]
+            '''
+
+
+
             platform_cls_qualname = resolve_current_platform_cls_qualname()
             _current_platform = resolve_obj_by_qualname(
                 platform_cls_qualname)()

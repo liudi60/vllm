@@ -142,6 +142,29 @@ class SchedulerConfig:
     structured outputs, speculative decoding, and pipeline parallelism.
     """
 
+    max_prefill_batch_size: int = 0
+    """while doing prefill batching, if current batch size is greater than 
+    max_prefill_batch_size, then stop.
+    """
+
+    min_prefill_batch_size: int = 0
+    """while doing prefill batching, if current batch size is less than 
+    min_prefill_batch_size, then batching thread sleep for a period of time
+    (eg. scheduler_delay_us), then continue batching.
+    """
+
+    prefill_request_batching_timeout_ms: int = 0
+    """while doing prefill batching, if current batch`s pending time (now-arrival_time)
+    id less than prefill_request_batching_timeout, then batching thread sleep for a period 
+    of time: scheduler_delay_us.     
+    """
+
+    scheduler_delay_us: int = 1000  # 1ms
+    """while doing prefill batching in the loop, if the request can`t join the batch,
+    the thread need to sleep for scheduler_delay_us us, then jump to next loop.
+    """
+
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

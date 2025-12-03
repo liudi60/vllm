@@ -17,6 +17,8 @@ from vllm.v1.engine import (EngineCoreEvent, EngineCoreEventType,
                             EngineCoreRequest, FinishReason)
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
@@ -25,6 +27,20 @@ if TYPE_CHECKING:
 
 class Request:
 
+    '''
+    request_id	str	用户指定或自动生成的唯一 ID
+    prompt	str	原始输入文本（仅当未 tokenized 时存在）
+    prompt_token_ids	List[int]	已 tokenize 的 prompt IDs（核心输入）
+    block_tables	Optional[Dict[int, List[Block]]]	每个 sequence 的 block 映射表（由 block manager 管理）
+    sampling_params	SamplingParams	采样参数（temperature, top_p, max_tokens 等）
+    sequences	List[Sequence]	生成序列列表（通常 1 个，beam search 时 >1）
+    arrival_time	float	请求到达时间（用于 metrics）
+    metrics	Optional[SequenceGroupMetrics]	性能指标（排队时间、调度时间等）
+    lora_request	Optional[LoRARequest]	关联的 LoRA 适配器信息
+    encoder_seq_data	Optional[EncoderSequenceData]	encoder-decoder 模型的 encoder 输入
+    multi_modal_data	Optional[MultiModalData]	多模态数据（如图像）
+    num_cached_tokens	int	已缓存的 token 数（用于 prompt caching 统计）
+    '''
     def __init__(
         self,
         request_id: str,
@@ -103,8 +119,8 @@ class Request:
         # Read-only views
         # Prevent directly appending to these lists since
         # they should also be updated simultaneously.
-        self.output_token_ids = ConstantList(self._output_token_ids)
-        self.all_token_ids = ConstantList(self._all_token_ids)
+        self.output_token_ids = ConstantList(self._output_token_ids)  # _output_token_ids：仅包含模型生成的 output tokens（不包括 prompt）
+        self.all_token_ids = ConstantList(self._all_token_ids)  # all_token_ids：完整的 token ID 序列，包括 prompt + 已生成的 output tokens
         # trace_headers
         self.trace_headers = trace_headers
         # State
@@ -121,6 +137,9 @@ class Request:
         if block_hasher is not None:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
+
+        # ===== Request() len(self._all_token_ids)=18
+        logger.warning(f'===== Request() len(self._all_token_ids)={len(self._all_token_ids)}')
 
     @classmethod
     def from_engine_core_request(
@@ -151,6 +170,7 @@ class Request:
         self,
         token_ids: Union[int, list[int]],
     ) -> None:
+        logger.warning(f'===== append_output_token_ids, token_ids={token_ids}')
         if isinstance(token_ids, int):
             self._output_token_ids.append(token_ids)
             self._all_token_ids.append(token_ids)

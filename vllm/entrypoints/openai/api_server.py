@@ -14,6 +14,7 @@ import secrets
 import signal
 import socket
 import tempfile
+import threading
 import uuid
 from argparse import Namespace
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
@@ -2212,15 +2213,17 @@ async def run_server_worker(listen_address,
 
 
 if __name__ == "__main__":
+    logger.warning(f'===== api_server main, pid={os.getpid()}, tid={threading.get_ident()}')  # pid=62392
+
     # NOTE(simon):
     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
     # entrypoints.
     cli_env_setup()
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server.")
-    parser = make_arg_parser(parser)
+    parser = make_arg_parser(parser)  # 这里会调用到 EngineArgs.add_cli_args(parser)
     args = parser.parse_args()
     logger.warning(f'===== 启动服务, args={args}')
     validate_parsed_serve_args(args)
 
-    uvloop.run(run_server(args))
+    uvloop.run(run_server(args))  # 这里也会调用到 EngineArgs.add_cli_args(parser)，二者的parser参数也一样，为什么调用两次？可能是uvloop中使用async一步的原因吧

@@ -373,3 +373,7 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
     kv_cache_groups: list[KVCacheGroupSpec]
+    """reserve block num in block pool, these blocks are only available for 
+    requests in decode phase, and only when idle block num(exclude reserved blocks) 
+    in block pool is insufficient, and only for single one request."""
+    reserved_block_num: int = 0

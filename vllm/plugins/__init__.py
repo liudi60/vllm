@@ -23,7 +23,18 @@ def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
 
     allowed_plugins = envs.VLLM_PLUGINS
 
-    discovered_plugins = entry_points(group=group)
+    logger.warning(f'===== load_plugins_by_group, envs.VLLM_PLUGINS={envs.VLLM_PLUGINS}')  # None
+    '''
+    entry_points={
+        "vllm.platform_plugins": ["ascend = vllm_ascend:register"],
+        "vllm.general_plugins":
+        ["ascend_enhanced_model = vllm_ascend:register_model"],
+    }
+    '''
+    logger.warning(f'===== load_plugins_by_group, group={group}')  # group=vllm.platform_plugins
+    discovered_plugins = entry_points(group=group)  # 这里边查找到vllm-ascend插件的。group："vllm.platform_plugins"
+    # discovered_plugins=[EntryPoint(name='ascend', value='vllm_ascend:register', group='vllm.platform_plugins')]
+    logger.warning(f'===== load_plugins_by_group, discovered_plugins={discovered_plugins}')
     if len(discovered_plugins) == 0:
         logger.debug("No plugins for group %s found.", group)
         return {}
@@ -67,6 +78,7 @@ def load_general_plugins():
     plugins_loaded = True
 
     plugins = load_plugins_by_group(group=DEFAULT_PLUGINS_GROUP)
+    logger.warning(f'===== load_general_plugins, plugins={plugins}')
     # general plugins, we only need to execute the loaded functions
     for func in plugins.values():
         func()

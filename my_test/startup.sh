@@ -28,7 +28,11 @@ python -m vllm.entrypoints.openai.api_server \
        --port 8000 \
 		--enforce-eager \
 		--compilation-config '{"cudagraph_capture_sizes": [1]}' \
-		--scheduling-policy "sjf"
+		--scheduling-policy "sjf" \
+		--min-prefill-batch-size 2 \
+		--prefill-request-batching-timeout-ms 10000 \
+		--scheduler-delay-us 1000000 \
+		--reserved-block-num 29
 
 
 cd -

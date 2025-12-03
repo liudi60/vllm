@@ -51,10 +51,99 @@ class Scheduler(SchedulerInterface):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
+
+        """获取完整的调用栈"""
+        import inspect
+        import json
+        stack = inspect.stack()
+        stack_details = []
+
+        for frame_info in stack[1:]:  # 跳过当前函数
+            frame, filename, lineno, function, code_line, index = frame_info
+            stack_details.append({
+                'filename': filename,
+                'line_number': lineno,
+                'function': function,
+                'code_line': code_line
+            })
+        logger.warning(
+            f'===== Scheduler() stack_details={json.dumps(stack_details, indent=4)}')
+
+        '''
+        ===== Scheduler() stack_details=[
+        {
+            "filename": "/home/liudi/vllm/vllm/v1/engine/core.py",
+            "line_number": 151,
+            "function": "__init__",
+            "code_line": [
+                "        self.scheduler: SchedulerInterface = Scheduler(\n"
+            ]
+        },
+        {
+            "filename": "/home/liudi/vllm/vllm/v1/engine/core.py",
+            "line_number": 542,
+            "function": "__init__",
+            "code_line": [
+                "            super().__init__(vllm_config, executor_class, log_stats,\n"
+            ]
+        },
+        {
+            "filename": "/home/liudi/vllm/vllm/v1/engine/core.py",
+            "line_number": 752,
+            "function": "run_engine_core",
+            "code_line": [
+                "                engine_core = EngineCoreProc(*args, **kwargs)\n"
+            ]
+        },
+        {
+            "filename": "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py",
+            "line_number": 108,
+            "function": "run",
+            "code_line": [
+                "            self._target(*self._args, **self._kwargs)\n"
+            ]
+        },
+        {
+            "filename": "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py",
+            "line_number": 314,
+            "function": "_bootstrap",
+            "code_line": [
+                "                self.run()\n"
+            ]
+        },
+        {
+            "filename": "/usr/local/python3.11.13/lib/python3.11/multiprocessing/spawn.py",
+            "line_number": 135,
+            "function": "_main",
+            "code_line": [
+                "    return self._bootstrap(parent_sentinel)\n"
+            ]
+        },
+        {
+            "filename": "/usr/local/python3.11.13/lib/python3.11/multiprocessing/spawn.py",
+            "line_number": 122,
+            "function": "spawn_main",
+            "code_line": [
+                "    exitcode = _main(fd, parent_sentinel)\n"
+            ]
+        },
+        {
+            "filename": "<string>",
+            "line_number": 1,
+            "function": "<module>",
+            "code_line": null
+        }
+    ]
+        '''
+
+
+
+
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
+        # kv_cache_config 是在 core.py中 _initialize_kv_caches 函数初始化的
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
@@ -70,10 +159,14 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None)
 
         # Scheduling constraints.
-        self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        logger.warning(f'===== Scheduler, self.scheduler_config={self.scheduler_config}')
+        self.max_num_running_reqs = self.scheduler_config.max_num_seqs  # running队列中的请求数不能超过该限制
         self.max_num_scheduled_tokens = \
-            self.scheduler_config.max_num_batched_tokens
+            self.scheduler_config.max_num_batched_tokens  # running batch 和 waiting batch 两个batch中加起来请求数不能超过该限制。token_budget 初始化为 max_num_scheduled_tokens
         self.max_model_len = self.scheduler_config.max_model_len
+        self.min_prefill_batch_size = self.scheduler_config.min_prefill_batch_size
+        self.prefill_request_batching_timeout_ms = self.scheduler_config.prefill_request_batching_timeout_ms
+        self.scheduler_delay_us = self.scheduler_config.scheduler_delay_us
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events)
@@ -170,6 +263,7 @@ class Scheduler(SchedulerInterface):
 
         # 创建KVCacheManager
         # Create the KV cache manager.
+        logger.warning(f'===== Scheduler, kv_cache_config={kv_cache_config}')
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -188,6 +282,22 @@ class Scheduler(SchedulerInterface):
             self.peak_split_factor = vllm_config.additional_config.get("peak_split_factor", 0.5)
 
         self.chunked_prefill_tail_optimization_factor = vllm_config.additional_config.get("chunked_prefill_tail_optimization_factor", 1)
+
+
+    # 计算一个prefill请求在组batch时需要等待的时间（单位：ms），可以立即组batch时，返回0
+    def _compute_prefill_request_pending_delay_ms(self, scheduled_new_reqs:list[Request], req:Request, token_budget:int) -> int:
+        logger.warning(f'===== compute_prefill_request_pending_delay_ms, req={req}, \n vllm_config={self.vllm_config}, \n kv_cache_config={self.kv_cache_config}')
+        logger.warning(f'===== self.min_prefill_batch_size={self.min_prefill_batch_size}, self.prefill_request_batching_timeout_ms={self.prefill_request_batching_timeout_ms}, self.scheduler_delay_us={self.scheduler_delay_us}')
+        # prefill请求包括：running队列中的chunk-prefill请求、waiting队列中的新请求、waiting队列中preempted请求（由于次判断在 not preempted_reqs 下，所以不用考虑此情况）
+        # prefill 组batch时，对于每个请求的判断逻辑：
+        # 只有当prefill_batch_size没达到min_prefill_batch_size，并且当前请求没有超时，这两个条件下，才会sleep，其他情况均放行
+
+        # 是否sleep？对。ibis中使用的 scheduler_cv_.wait_for(lock, timeout)；
+        if (len(scheduled_new_reqs) < self.scheduler_config.min_prefill_batch_size
+                and (time.time() - req.arrival_time) * 1000 < self.scheduler_config.prefill_request_batching_timeout_ms):  # 统一用ms计算
+            return self.scheduler_config.scheduler_delay_us
+
+        return 0
 
 
     def schedule(self) -> SchedulerOutput:
@@ -231,6 +341,24 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         # todo 首先处理running队列
+        '''
+        二、running 队列：存放哪些请求？
+            running 队列保存当前已分配 KV Cache block、正在参与（或即将参与）本轮 GPU 推理的请求。
+            
+            ✅ 包含以下几类请求：
+            请求类型	说明
+            1. 正在 Decode 的请求	已完成 prefill，正在逐个生成输出 token（num_computed_tokens > prompt_len）。这是主体。
+            2. 刚被调度进来的 Prefill 请求	在 schedule() 中刚从 waiting 移入 running，将在本轮执行 prefill。
+            3. 被恢复（Resumed）的请求	之前因抢占被 swap out，现在 swap in 成功，重新加入 running 继续 decode。
+            4. 推测解码中的目标/草稿请求	在 Speculative Decoding 模式下，主模型和草稿模型的请求都可能在 running 中协同调度。
+            ⚠️ 注意：
+            running 中的请求不一定都在本轮被实际计算！
+            例如：token budget 用完后，后面排队的 running 请求会“挂起”，留到下一轮。
+            请求在 running 中时，必须已分配 KV Cache block（无论在 GPU 还是 CPU swap）。
+            🔹 关键特征：request.status == RequestStatus.RUNNING
+            
+            （但在调度过程中，状态可能临时为 WAITING_FOR_REMOTE_KVS 等，随后转为 RUNNING）
+        '''
         logger.warning(f'===== Scheduler.schedule()中，处理running队列')
         # First, schedule the RUNNING requests.
         '''
@@ -275,6 +403,7 @@ class Scheduler(SchedulerInterface):
             循环结束 → 继续处理 swapped 或 waiting 队列
             ⚠️ 注意：vLLM 按顺序调度 running 请求，不会跳过某个请求去处理后面的（保证公平性和简单性）。
         '''
+        # 此时的running队列中，没有未处理的prefill请求了，上次调度从waiting队列加入到running队列中的prefill请求，已经推理一轮了，然后再进入当前调度中。
         while req_index < len(self.running) and token_budget > 0:
 
             request = self.running[req_index]  # 单线程处理，EngineCore进程的主线程，没有并发问题
@@ -293,20 +422,128 @@ class Scheduler(SchedulerInterface):
             '''
 
             '''
-                # num_tokens_with_spec	    在 speculative decoding 下，目标模型 + 草稿模型总共要验证的 token 数（含已生成的）
-                # num_output_placeholders	为未来输出预留的 token 位置数（通常 = num_tokens_with_spec）
-                # num_computed_tokens	    已经完成计算的 token 数（包括 prefill 和已 decode 的）
-                # 📌 所以 num_new_tokens = 还需要计算的 token 数量
-                
-                ✅ 举例：
-                prompt: 100 tokens（已 prefill）
-                已 decode: 5 tokens
-                spec decoding 要验证 next 3 tokens
-                则 num_tokens_with_spec = 100 + 5 + 3 = 108
-                num_computed_tokens = 105
-                num_new_tokens = 108 - 105 = 3
+            用于计算 当前调度轮次中需要为该请求新分配 KV Cache slots 的 token 数量。这是调度器（Scheduler）在决定如何分配显存资源时的关键逻辑。
+
+            下面逐个解释这三个属性的含义，并说明为什么这样计算。
+            
+            🔍 一、三个属性详解
+            1. request.num_tokens_with_spec
+            含义：当前请求在考虑 speculative decoding（推测解码）后的总 token 数。
+            组成：
+            已输入的 prompt tokens
+            已生成的 output tokens
+            + 推测解码中“预测”的 future tokens（draft tokens）
+            目的：为 speculative decoding 预留额外的 KV Cache 空间。
+            💡 如果未启用 speculative decoding，则 num_tokens_with_spec == request.num_tokens（即普通总 token 数）。
+            
+            2. request.num_output_placeholders
+            含义：为未来输出预留的“占位符” token 数量。
+            典型值：通常等于 max_tokens（用户指定的最大生成长度）或动态预分配值。
+            作用：
+            在 prefill 阶段就预先分配 decode 阶段可能需要的 block slots
+            避免在 decode 过程中频繁申请显存（提升性能）
+            尤其在 PagedAttention + BlockSpaceManager 中用于预分配物理 blocks
+            ✅ 这是一种 “预分配”优化策略，减少运行时内存碎片和分配开销。
+            
+            📌 注意：这些 placeholder 尚未真实生成，只是预留位置。
+            
+            3. request.num_computed_tokens
+            含义：该请求已经完成计算（或已加载 KV Cache）的 token 数量。
+            包括：
+            Prefill 阶段已处理的 prompt tokens
+            Decode 阶段已生成的 output tokens
+            （如果启用了 prefix cache）命中的缓存 tokens
+            不包括：
+            尚未处理的 prompt tokens
+            未生成的 output tokens
+            speculative decoding 的 draft tokens（除非已验证）
+            ✅ 这个值用于追踪请求的进度。
+            
+            🧮 二、为什么这样计算 num_new_tokens？
+            公式：
+            num_new_tokens = (num_tokens_with_spec + num_output_placeholders) - num_computed_tokens
+            逻辑解释：
+            “总共需要的空间” 减去 “已经有的空间” = “还需要新分配的空间”
+            
+            项	说明
+            num_tokens_with_spec	当前已知的所有 token（含 speculative 预测）
+            + num_output_placeholders	再加上为未来 output 预留的 slot（保守预分配）
+            - num_computed_tokens	减去已经分配并使用的 token 数
+            ✅ 结果就是：本次调度需要新申请的 KV Cache slots 对应的 token 数。
+            
+            📊 三、举个实际例子
+            假设一个请求：
+            
+            Prompt 长度：100 tokens
+            用户设置 max_tokens=50（最多生成 50 个 output）
+            已生成 10 个 output tokens
+            启用了 speculative decoding，当前预测了 5 个 draft tokens
+            调度器预分配了全部 50 个 output 的 placeholders
+            则：
+            
+            num_tokens_with_spec = 100 (prompt) + 10 (generated) + 5 (draft) = 115
+            num_output_placeholders = 50（预分配的 output slots）
+            num_computed_tokens = 100 + 10 = 110（已计算的 prompt + output）
+            计算：
+            num_new_tokens = (115 + 50) - 110 = 55
+            但注意：这 55 包含了：
+            
+            5 个 draft tokens 的 slots
+            40 个未生成 output 的 placeholder slots（50 - 10 已生成）
+            💡 实际实现中，num_output_placeholders 可能只指 尚未分配的 placeholder，具体取决于版本。但在多数情况下，它代表总的预分配 output 长度。
+            
+            ⚠️ 四、注意事项
+            num_output_placeholders 并非总是等于 max_tokens
+            可能受 --max-model-len 或 block manager 策略限制
+            有些版本中，它只表示 本次调度要预分配的数量
+            Speculative decoding 是关键触发条件
+            若未启用 spec decode，num_tokens_with_spec ≈ num_computed_tokens + 1（下一个 token）
+            这个值用于 allocate_slots()
+            最终传给 allocate_slots(num_new_tokens=...) 来申请 GPU 显存
+            ✅ 五、总结
+            属性	含义	是否包含 speculative	是否包含预分配
+            num_tokens_with_spec	当前总 token（含 draft）	✅ 是	❌ 否
+            num_output_placeholders	为 output 预留的 slot 数	❌ 否	✅ 是
+            num_computed_tokens	已计算/加载的 token 数	❌ 否（draft 未验证不算）	❌ 否
+            💡 设计目的：
+            
+            提前为 speculative decoding 和未来 output 分配足够 KV Cache，避免运行时 OOM 或频繁分配，同时精确计算所需新 slots。
+            
+            这是 vLLM 实现 高性能、支持推测解码、预分配优化 的核心调度逻辑之一。
             '''
-            num_new_tokens = (request.num_tokens_with_spec +
+            '''
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:46 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=19, request.num_output_placeholders=0, request.num_computed_tokens=18
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:46 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=20, request.num_output_placeholders=0, request.num_computed_tokens=19
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=21, request.num_output_placeholders=0, request.num_computed_tokens=20
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=22, request.num_output_placeholders=0, request.num_computed_tokens=21
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=23, request.num_output_placeholders=0, request.num_computed_tokens=22
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=24, request.num_output_placeholders=0, request.num_computed_tokens=23
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=25, request.num_output_placeholders=0, request.num_computed_tokens=24
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=26, request.num_output_placeholders=0, request.num_computed_tokens=25
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=27, request.num_output_placeholders=0, request.num_computed_tokens=26
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=28, request.num_output_placeholders=0, request.num_computed_tokens=27
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=29, request.num_output_placeholders=0, request.num_computed_tokens=28
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=30, request.num_output_placeholders=0, request.num_computed_tokens=29
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=31, request.num_output_placeholders=0, request.num_computed_tokens=30
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=32, request.num_output_placeholders=0, request.num_computed_tokens=31
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=33, request.num_output_placeholders=0, request.num_computed_tokens=32
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:47 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=34, request.num_output_placeholders=0, request.num_computed_tokens=33
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=35, request.num_output_placeholders=0, request.num_computed_tokens=34
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=36, request.num_output_placeholders=0, request.num_computed_tokens=35
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=37, request.num_output_placeholders=0, request.num_computed_tokens=36
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=38, request.num_output_placeholders=0, request.num_computed_tokens=37
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=39, request.num_output_placeholders=0, request.num_computed_tokens=38
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=40, request.num_output_placeholders=0, request.num_computed_tokens=39
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=41, request.num_output_placeholders=0, request.num_computed_tokens=40
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=42, request.num_output_placeholders=0, request.num_computed_tokens=41
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=43, request.num_output_placeholders=0, request.num_computed_tokens=42
+            (EngineCore_DP0 pid=72223) WARNING 11-27 07:33:48 [scheduler.py:436] ===== schedule running, request.num_tokens_with_spec=44, request.num_output_placeholders=0, request.num_computed_tokens=43
+            '''
+            logger.warning(f'===== schedule running, request.num_tokens_with_spec={request.num_tokens_with_spec}, '
+                           f'request.num_output_placeholders={request.num_output_placeholders}, request.num_computed_tokens={request.num_computed_tokens}')
+            # request.num_computed_tokens 包含了prefix-cache匹配到的tokens，是在waiting队列处理时的如下代码设置的：
+            # num_computed_tokens = (num_new_local_computed_tokens + num_external_computed_tokens)
+            num_new_tokens = (request.num_tokens_with_spec +  # 本次调度，该请求推理后总共的token数 - 该请求现已分配的token数
                               request.num_output_placeholders -
                               request.num_computed_tokens)
             '''
@@ -322,6 +559,7 @@ class Scheduler(SchedulerInterface):
                     if long_prefill_token_threshold <= num_new_tokens and chunked_prefill_enabled:
                 ✅ 目的：平衡吞吐与延迟，避免大尾块拖慢整个 batch
             '''
+            # 开启chunk-prefill后，计算了一部分chunk的请求，会一直在running队列中
             if (0 < self.chunked_prefill_tail_optimization_factor * self.scheduler_config.long_prefill_token_threshold <=
                     num_new_tokens and self.chunked_prefill_enabled):
                 num_new_tokens = (
@@ -393,7 +631,7 @@ class Scheduler(SchedulerInterface):
                 # logger.warning(
                 #     f'===== class Scheduler.schedule(), 处理running队列, 分配new_blocks, new_blocks={new_blocks}')
 
-                # 2、物理block分配失败，显存不足
+                # 2、物理block分配失败，显存不足，抢占，放回waiting队列头部，释放blocks
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -485,6 +723,26 @@ class Scheduler(SchedulerInterface):
 
 
         # todo 上面先处理running队列，如果running队列为空，则跳过，到此处理waiting队列
+        '''
+        一、waiting 队列：存放哪些请求？
+            waiting 队列保存尚未开始任何 GPU 计算（或尚未进入 running 状态）的请求。
+            
+            ✅ 包含以下几类请求：
+            请求类型	说明
+            1. 新到达的 Prefill 请求	用户刚提交的请求，prompt 尚未被处理（即 num_computed_tokens == 0）。这是最常见的类型。
+            2. 被抢占（Preempted）后需重新 Prefill 的请求	如果一个请求因显存不足被 swap out 或 recompute preempted（非保留 KV Cache），则下次调度时需从头开始 prefill，会回到 waiting。
+            3. 因资源不足被跳过的请求	例如：
+            • LoRA adapter 超限
+            • token budget 不足
+            • 需要异步加载远程 KV（如 KVTransfer）但尚未就绪
+            这些请求会被临时放入 skipped_waiting_requests，随后放回 waiting 头部重试。
+            4. 推测解码中草稿模型失败后需 fallback 的请求	（较少见）某些 speculative decoding 实现可能将验证失败的请求暂退回到 waiting。
+            ❌ 不包含：
+            已经部分生成 token 的 decode 请求（除非被完全抢占且无缓存）
+            正在运行的请求
+            已完成的请求
+            🔹 关键特征：request.status == RequestStatus.WAITING
+        '''
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -535,25 +793,83 @@ class Scheduler(SchedulerInterface):
             # token_budget：本轮 batch 剩余可处理的 token 数量（由 max_num_batched_tokens 控制）。
             # max_num_running_reqs：running 队列的最大请求数（防上下文切换开销）。
             # scheduled_loras：本轮已调度请求使用的 LoRA ID 集合。
+            # 本轮调度中，prefill batch当前需要新的token数
+            # # min_prefill_batch_size 限制时是否考虑 chunk-prefill 请求，暂时不考虑
+            # num_chunk_prefill_reqs = len([0 for req in scheduled_running_reqs if (req.num_computed_tokens < len(req.prompt_token_ids))])
             while self.waiting and token_budget > 0:
-                self.waiting.get_statistics()
                 logger.warning(f'===== class Scheduler.schedule(), 处理waiting队列, token_budget={token_budget}, self.waiting={self.waiting}')
-                if len(self.running) == self.max_num_running_reqs:  # 检查 running 队列是否已满，即使还有 token 预算，也不能超过最大并发请求数。这是为了控制 GPU 上下文切换开销 和 调度复杂度
+                # 每循环1个请求，running队列都可能新增请求，所以要检查 running 队列是否已达到max_num_running_reqs限制，即使还有 token 预算，也不能超过最大并发请求数。这是为了控制 GPU 上下文切换开销 和 调度复杂度
+                if len(self.running) == self.max_num_running_reqs:  # running队列是现在正处于推理阶段的请求数，限制该数量不能超过配置值
                     break
 
                 # todo 这里就是从waiting队列中获取请求，waiting队列有多种实现算法：FCFS、Priority、SJF、SJFInHeap
                 request = self.waiting.peek_request()  # 查看下一个待调度请求（不弹出），后续根据资源检查结果，决定是否真正弹出并调度。
 
-                # 处理远程 KV Cache 依赖（KVTransfer 场景）
-                # 背景：
-                # 在 分布式推理 或 KV Cache 共享 场景中，某些请求需等待远程节点发送 KV Cache。
-                # 状态为 WAITING_FOR_REMOTE_KVS 表示“正在等远程数据”。
-                # 逻辑：
-                # 调用 _update_waiting_for_remote_kv() 检查是否已收到数据。
-                # 若已就绪 → 改为 WAITING，本次可调度。
-                # 若未就绪 → 弹出该请求，放入 skipped_waiting_requests（临时队列），稍后放回 waiting 头部重试。
-                # 💡 skipped_waiting_requests.prepend_request(request)：避免饥饿，确保下次优先重试。
-                # KVTransfer: skip request if still waiting for remote kvs.
+                # 达到 max_prefill_batch_size，停止waiting队列调度
+                if len(scheduled_new_reqs) > self.scheduler_config.max_prefill_batch_size:
+                    logger.warning(f'===== reach max_prefill_batch_size，break waiting_queue schedule')
+                    break
+                # 判断请求是否可以立即组batch，或者等待固定时间
+                delay_us = self._compute_prefill_request_pending_delay_ms(scheduled_new_reqs, request, token_budget)
+                if delay_us > 0:
+                    logger.warning(f'===== prefill request pending delay, curr_time: {time.time()} s')
+                    time.sleep(delay_us / 1_000_000)
+                    continue
+
+                '''
+                RequestStatus.WAITING_FOR_REMOTE_KVS状态值介绍
+                
+                出现在调度器（Scheduler）或请求状态管理逻辑中，其目的是 处理分布式推理场景下 KV Cache 跨节点传输的等待状态。这是 vLLM 支持多机（multi-node）推理 的关键机制之一。
+
+                🔍 背景：什么是 “Remote KV Cache”？
+                在 单机 vLLM 中，所有请求的 KV Cache 都存储在本地 GPU 显存中。
+                
+                但在 分布式 vLLM（如使用 Ray 或自定义多机后端） 中：
+                
+                一个请求的 KV Cache 可能被卸载（offload）到远程节点
+                当该请求需要继续生成（decode）时，必须 先从远程节点拉取 KV Cache 回本地
+                此时，请求会进入 WAITING_FOR_REMOTE_KVS 状态，暂停调度，直到 KV Cache 传输完成。
+                
+                ✅ 什么场景会走到这个分支？
+                场景 1：多机推理 + KV Cache 卸载（Offloading）
+                当 GPU 显存不足时，vLLM 可能将部分 swapped 请求的 KV Cache 存储到 其他机器的 CPU/GPU 内存（而非本地磁盘）
+                下次调度该请求时，需先 异步拉取远程 KV Cache
+                在拉取完成前，请求状态设为 WAITING_FOR_REMOTE_KVS
+                调度器检测到此状态，跳过该请求，不将其加入当前 batch
+                📌 这是 分布式 PagedAttention 的扩展行为（目前 vLLM 官方主干尚未完全开源多机版，但企业版或研究分支支持）
+                
+                场景 2：Speculative Decoding + 辅助模型在远程
+                在某些 speculative decoding 架构中，draft model 可能在另一台机器上运行
+                验证阶段需要同步 KV 状态，也可能触发远程 KV 等待
+                （较少见，属于高级用法）
+                
+                场景 3：自定义后端或实验性功能
+                如果你在使用 vLLM 的 fork 分支（如阿里、NVIDIA 内部版本），可能实现了 跨节点 KV Cache 共享
+                此状态用于协调多机间的请求调度
+                🧠 为什么需要这个状态？
+                问题：如果没有 WAITING_FOR_REMOTE_KVS
+                调度器会尝试调度一个 KV Cache 不在本地 的请求
+                模型执行时发现 block_tables 指向的物理页不在本地 → 崩溃或错误
+                解决方案：
+                请求被 swap out 到远程节点时，状态设为 WAITING_FOR_REMOTE_KVS
+                后台异步任务开始拉取 KV Cache
+                拉取完成后，状态变回 RUNNING 或 SWAPPED
+                调度器下次轮询时正常调度
+                这保证了 “调度的请求，其 KV Cache 一定可用”。
+                
+                
+                处理远程 KV Cache 依赖（KVTransfer 场景）
+                背景：
+                在 分布式推理 或 KV Cache 共享 场景中，某些请求需等待远程节点发送 KV Cache。
+                状态为 WAITING_FOR_REMOTE_KVS 表示“正在等远程数据”。
+                逻辑：
+                调用 _update_waiting_for_remote_kv() 检查是否已收到数据。
+                若已就绪 → 改为 WAITING，本次可调度。
+                若未就绪 → 弹出该请求，放入 skipped_waiting_requests（临时队列），稍后放回 waiting 头部重试。
+                💡 skipped_waiting_requests.prepend_request(request)：避免饥饿，确保下次优先重试。
+                KVTransfer: skip request if still waiting for remote kvs.
+                '''
+                # 判断检查请求是否正在等待远程kv-cache传输过来
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
                     if is_ready:
@@ -562,18 +878,66 @@ class Scheduler(SchedulerInterface):
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
+                        self.waiting.pop_request()  # 该请求的远程kv-cache没有传输过来，则将该请求踢出waiting队列
+                        skipped_waiting_requests.prepend_request(request)  # 暂时放入 skipped_waiting_requests 这个临时队列中，该队列放的是本轮调度中被忽略的请求，待本轮调度完成后，skipped_waiting_requests中请求重新加到waiting队列中
                         continue
 
-                # 处理结构化输出（FSM 编译中）
-                # 背景：
-                # 当用户要求 结构化输出（如 JSON Schema、正则表达式），vLLM 需先编译成 有限状态机（FSM）。
-                # 编译是异步的，可能尚未完成。
-                # 逻辑：
-                # 检查 FSM 是否已生成（grammar 是否存在）。
-                # 若已完成 → 改为 WAITING，可调度。
-                # 若未完成 → 暂时跳过，放入 skipped 队列。
+                '''
+                RequestStatus.WAITING_FOR_FSM状态介绍 
+                这通常表示该请求正在 等待有限状态机（FSM, Finite State Machine）的约束处理完成，尤其与 结构化输出（structured output） 或 词法/语法引导生成（grammar-guided generation） 相关。
+
+                🔍 背景：什么是 FSM 在 LLM 生成中的作用？
+                在 vLLM 中，FSM 一般指 基于语法规则（如 JSON Schema、正则表达式、EBNF grammar）构建的有限状态机，用于 约束 LLM 的输出，确保生成内容符合特定格式。
+                
+                例如：
+                强制模型输出合法 JSON
+                限制聊天机器人的回复只能是预定义选项
+                生成符合 SQL 语法的查询
+                vLLM 通过集成 outlines 或自研 FSM 引擎，在 token 采样阶段动态剪枝 logits，只允许生成符合 FSM 当前状态的 token。
+                
+                ✅ WAITING_FOR_FSM 状态的含义
+                当一个请求设置了 结构化输出约束（如 guided_decoding），但在当前调度轮次中：
+                
+                FSM 尚未构建完成（异步构建中），或
+                FSM 状态更新被延迟（例如依赖上一轮生成的 token 来推进状态）
+                此时，请求会被置为：RequestStatus.WAITING_FOR_FSM
+                调度器（Scheduler）检测到此状态后，会 暂时跳过该请求，不将其加入当前 batch，直到 FSM 准备就绪。
+                
+                🧩 典型触发场景
+                场景 1：首次 Prefill 阶段构建 FSM
+                用户发起一个带 guided_json={...} 的请求
+                vLLM 需要根据 JSON Schema 异步编译 FSM
+                在 FSM 编译完成前，请求状态设为 WAITING_FOR_FSM
+                编译完成后，状态恢复为 RUNNING，进入正常调度
+                💡 为什么异步？避免阻塞主线程，提升吞吐。
+                
+                场景 2：Decode 阶段等待 FSM 状态推进
+                上一轮生成了一个 token（如 {）
+                FSM 需要根据这个 token 计算下一个允许的 token 集合
+                如果该计算被延迟（如批量处理 FSM 更新），请求会短暂进入等待状态。
+                
+                
+                处理结构化输出（FSM 编译中）
+                背景：
+                当用户要求 结构化输出（如 JSON Schema、正则表达式），vLLM 需先编译成 有限状态机（FSM）。
+                编译是异步的，可能尚未完成。
+                逻辑：
+                检查 FSM 是否已生成（grammar 是否存在）。
+                若已完成 → 改为 WAITING，可调度。
+                若未完成 → 暂时跳过，放入 skipped 队列。
+                
+                
+                ✅ 总结
+                问题	                    答案
+                WAITING_FOR_FSM 是什么？	请求正在等待 结构化输出 FSM（有限状态机）准备就绪
+                为什么需要等待？	        FSM 需要根据 schema 异步构建，或根据上一轮输出更新状态
+                什么功能会触发？	        使用 guided_json / guided_regex / guided_grammar 等 引导生成（guided decoding） 功能
+                开源版会走到这里吗？	    ✅ 会，如果你启用了 guided decoding（vLLM 已支持 outlines 集成）
+                💡 提示：该状态是 临时性、短暂的，正常情况下会在 1~2 个调度周期内恢复为 WAITING。
+                
+                这种设计使得 vLLM 能在 不牺牲吞吐的前提下，安全地支持复杂的结构化输出约束。
+                '''
+                # 判断FSM异步构建是否完成
                 # Skip request if the structured output request is still waiting
                 # for FSM compilation.
                 if request.status == RequestStatus.WAITING_FOR_FSM:
@@ -581,19 +945,50 @@ class Scheduler(SchedulerInterface):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
+                        self.waiting.pop_request()  # FSM异步构建没完成，则当前请求从waiting队列弹出
+                        skipped_waiting_requests.prepend_request(request)  # 放入临时队列 skipped_waiting_requests，待本轮调度完成后，skipped_waiting_requests中请求重新加到waiting队列中
                         continue
 
-                # 检查 LoRA 限制
+                '''
+                LoRA介绍
+                vLLM 的调度器（Scheduler） 中，用于在 启用 LoRA（Low-Rank Adaptation）微调模型 的场景下，控制同时激活的 LoRA 适配器数量不超过限制。
+                
+                条件拆解：
+                子条件	                                                    含义
+                self.lora_config	                                        当前引擎启用了 LoRA 支持（即传入了 --enable-lora 等参数）
+                request.lora_request	                                    当前请求指定了要使用的 LoRA 适配器（如通过 API 传了 lora_name）
+                len(scheduled_loras) == self.lora_config.max_loras	        当前已调度的 LoRA 适配器数量已达上限（例如最多同时加载 2 个 LoRA）
+                request.lora_request.lora_int_id not in scheduled_loras	    当前请求所需的 LoRA 不在已调度的集合中
+                ✅ 整个 if 成立的含义是：
+                
+                “这个请求需要一个 LoRA，但该 LoRA 没被加载，且系统已满载（无法再加载新 LoRA）”
+                
+                🎯 这段代码的作用：跳过无法调度的 LoRA 请求
+                当上述条件为真时，调度器会 暂时不调度该请求（通常将其保留在 waiting 队列中），直到：
+                
+                已加载的某个 LoRA 被释放（对应请求完成）
+                有空位可以加载这个新的 LoRA
+                这是为了满足 vLLM 的 LoRA 内存管理约束。
+                
+                🧠 背景知识：vLLM 如何支持多 LoRA？
+                vLLM 支持 动态切换多个 LoRA 适配器，但受 GPU 显存限制，不能无限加载。因此引入两个关键配置：
+                
+                配置项	说明
+                max_loras	最多同时加载多少个 LoRA 适配器（默认 1）
+                max_cpu_loras	最多缓存多少个 LoRA 在 CPU（可选）
+                每个 LoRA 会被分配一个唯一的 lora_int_id（整数 ID）
+                调度器维护一个集合 scheduled_loras，记录当前 GPU 上已加载的 LoRA ID
+                所有请求共享这 max_loras 个“插槽”
+                '''
+                # 判断一个带 LoRA 的请求是否因 LoRA 插槽已满且所需 LoRA 未加载 而无法调度
                 # Check that adding the request still respects the max_loras
                 # constraint.
                 if (self.lora_config and request.lora_request and
                     (len(scheduled_loras) == self.lora_config.max_loras and
                      request.lora_request.lora_int_id not in scheduled_loras)):
                     # Scheduling would exceed max_loras, skip.
-                    self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    self.waiting.pop_request()  # 该请求为LoRA请求，因为条件不满足而无法加入batch中，弹出waiting队列
+                    skipped_waiting_requests.prepend_request(request)  # 放入临时队列 skipped_waiting_requests，待本轮调度完成后，skipped_waiting_requests中请求重新加到waiting队列中
                     continue
 
                 # 下面的目标：确定本次 prefill 需要计算多少新 token（num_new_tokens），并检查是否能复用已有 KV。
@@ -603,17 +998,19 @@ class Scheduler(SchedulerInterface):
                 # 场景一：全新请求（num_computed_tokens == 0）
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
-                    # 获取本地已缓存的 block（Prefill 缓存复用）
+                    # 本地prefix-cache
+                    # 获取本地已缓存的 block（Prefill 缓存复用：prefix-cache）
                     # 作用：检查是否有完全相同的 prompt 已被计算过（例如相同输入多次请求）。
                     # 如果有：
-                    # 返回已有的物理 block 列表（new_computed_blocks）
-                    # 返回已计算 token 数（num_new_local_computed_tokens）
+                    # new_computed_blocks：prefix-cache命中的block列表。后续新allocate出来的blocks，会向后追加。
+                    # num_new_local_computed_tokens：已计算的token数。 new_computed_blocks 和 num_new_local_computed_tokens 这二者是一致的：num_new_local_computed_tokens = new_computed_blocks * block_size
                     # 否则返回空 block 列表和 0。
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = \
                         self.kv_cache_manager.get_computed_blocks(
                             request)
 
+                    # 远程prefix-cache
                     # 获取远程已缓存的 token（KVConnector / KVTransfer）
                     # 背景：在分布式推理或 KV 共享系统中（如 KVTransfer），其他节点可能已计算过该 prompt。
                     # connector 负责与远程节点通信，查询匹配的 token 数。
@@ -637,40 +1034,108 @@ class Scheduler(SchedulerInterface):
                             skipped_waiting_requests.prepend_request(request)
                             continue
 
-                    # 计算总已计算 token 数
+                    # 计算总已计算 token 数（即：总cache的token数 = 本地cache的token数 + 远程cache的token数）
                     # 合并本地 + 远程已计算的部分。
                     # 本次只需计算剩余部分：request.num_tokens - num_computed_tokens
                     # Total computed tokens (local + external).
                     num_computed_tokens = (num_new_local_computed_tokens +
                                            num_external_computed_tokens)
+
+                # '''
+                # 在 vLLM 的调度器（Scheduler） 中，waiting 队列里出现 request.num_computed_tokens > 0 的请求，通常表示这是一个 已经被部分处理过、但由于某种原因被中断或暂停，尚未完成 Prefill 阶段的请求。
+                # 这类请求 不是全新的请求，而是处于 “部分 Prefill 已完成” 的中间状态。
+                #
+                # ✅ 什么情况下 waiting 队列中的请求会有 num_computed_tokens > 0？
+                # 情况 1️⃣：启用了 Chunked Prefill（分块预填充）
+                # 这是最常见的原因。
+                #
+                # 当 prompt 很长（如 32k tokens），而当前 batch 的 token budget 不足时
+                # vLLM 会 只处理 prompt 的一部分（一个 chunk）
+                # 处理完后：
+                # request.num_computed_tokens += chunk_size
+                # 请求 未进入 running，而是 放回 waiting 队列尾部
+                # 下次调度继续处理剩余部分
+                # 📌 示例：
+                #
+                # python
+                # 编辑
+                # request.prompt = "A" * 50000  # 50k tokens
+                # scheduler.max_num_batched_tokens = 8192
+                # → 第一次调度处理前 8192 tokens → num_computed_tokens = 8192
+                # → 请求仍在 waiting 队列，等待下一轮处理 8193~16384...
+                #
+                # ✅ 这是正常行为，是 vLLM 支持超长 prompt 的关键机制。
+                #
+                # 情况 2️⃣：Prefill 被抢占（Preemption）
+                # 当系统资源紧张（如 GPU 显存不足）
+                # 调度器可能 暂停一个正在 Prefill 的请求
+                # 将其 KV Cache swap out 到 CPU
+                # 请求状态变回 waiting，但保留 num_computed_tokens
+                # ⚠️ 注意：这种情况较少见，因为 Prefill 通常优先级高，但极端负载下可能发生。
+                #
+                # 情况 3️⃣：Prefix Cache 加载 + 部分计算
+                # 请求命中部分 prefix cache（如前 1000 tokens）
+                # 但剩余部分因资源限制未能一次性完成
+                # num_computed_tokens = 1000 + 已计算的新 tokens
+                # 🧠 技术细节：num_computed_tokens 的含义
+                # 表示 该请求已经成功计算（或加载）的 token 数量
+                # 包括：
+                # 从 prefix cache 命中的 token
+                # 从外部缓存（CPU）加载的 token
+                # 本地新计算的 token
+                # 不包括 尚未处理的 prompt token
+                # 在 SequenceGroup 或 Request 对象中维护，用于：
+                #
+                # 决定下一次 Prefill 的起始位置
+                # 分配正确的 block slots
+                # 计算剩余工作量
+                # '''
                 # KVTransfer: WAITING reqs have num_computed_tokens > 0
                 # after async KV recvs are completed.
                 else:
-                    # 场景二：非全新请求（num_computed_tokens > 0）
-                    # 被抢占后恢复的请求（KVTransfer 场景）
+                    # 场景二：非全新请求（request.num_computed_tokens > 0）
+                    # 1、被抢占并且换出block（重计算场景下request.num_computed_tokens == 0）：
+                    # 被抢占后恢复的请求（KVTransfer 场景，即通过KVTransfer将block swapout远端卡上）
                     # 在 KVTransfer 等系统中，被抢占的请求可能保留了 num_computed_tokens > 0（因为 KV 被保存/传输）。
                     # 此时不尝试复用本地缓存（因为 block 可能来自远程），直接使用已有值。
+                    # 2、没有已部分计算的chunk-prefill请求，放在running队列中了
+
+                    '''
+                    在启用 chunked prefill 时，new_computed_blocks 被初始化为空（create_empty_block_list()），
+                    是因为当前 chunk 的计算结果尚未生成 KV blocks，而之前 chunk 的 blocks 已经通过 request.block_tables 
+                    持久化保存，不需要通过 new_computed_blocks 传递。
+                    '''
                     new_computed_blocks = (
-                        self.kv_cache_manager.create_empty_block_list())
-                    num_new_local_computed_tokens = 0
-                    num_computed_tokens = request.num_computed_tokens
+                        self.kv_cache_manager.create_empty_block_list())  # todo 这里怎么是空的？chunk-prefill之前的算的block不需要记录下来吗？答：本次chunk的计算不需要知道前面chunk算出来的blocks，所以new_computed_blocks是空的，前面算出来的blocks已经存在block_table中了。
+                    num_new_local_computed_tokens = 0  # todo 这个是？ 该请求本地已计算的token数。注意：new_computed_blocks 和 num_new_local_computed_tokens 保持一致。
+                    num_computed_tokens = request.num_computed_tokens  # 该请求总共已计算的token数。这里 request.num_computed_tokens 就是前面chunk已经算完的token数量
 
                 encoder_inputs_to_schedule = None
                 new_encoder_compute_budget = encoder_compute_budget
 
+                '''
+                如果当前正在异步加载远程 KV Cache，则本次调度轮次中不再为该请求分配新的计算任务（即不处理新的 tokens）。
+                问题	                            答案
+                这段代码的作用？	                在异步加载远程 KV Cache 期间，禁止为该请求分配新的计算任务
+                为什么设 num_new_tokens = 0？	    避免在 KV 未就绪时访问无效内存，保证推理正确性
+                什么场景会触发？	                分布式多机推理 中，KV Cache 存储在远程节点
+                开源 vLLM 会走到这里吗？	        ❌ 通常不会（除非启用实验性多机后端）
+                对用户的影响？	                    请求会短暂延迟，直到远程 KV 加载完成
+                '''
                 # KVTransfer: loading remote KV, do not allocate for new work.
                 if load_kv_async:
                     assert num_external_computed_tokens > 0
-                    num_new_tokens = 0
+                    num_new_tokens = 0  # todo
                 # Number of tokens to be scheduled.
                 else:
-                    # 正常情况：计算需处理的新 token
+                    # 正常情况：计算需计算的新 token
                     # request.num_tokens = prompt 长度 + 已生成输出长度（对 resumed 请求很重要）
                     # 减去已计算部分，得到真正需要 prefill 的 token 数
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    # 如果当前请求时新请求，并且开启了chunk-prefill，当 num_new_tokens 超过chunk-prefill的上限值 long_prefill_token_threshold 时，则将 num_new_tokens 设置为上限值 long_prefill_token_threshold
                     if (0 < self.chunked_prefill_tail_optimization_factor * self.scheduler_config.long_prefill_token_threshold
                             <= num_new_tokens and self.chunked_prefill_enabled):
                         num_new_tokens = (
@@ -683,12 +1148,12 @@ class Scheduler(SchedulerInterface):
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
                     if not self.scheduler_config.chunked_prefill_enabled and \
-                        num_new_tokens > token_budget:
+                        num_new_tokens > token_budget:  # 如果没开启chunk-prefill， num_new_tokens 比配额 token_budget 大，则跳过当前请求
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = min(num_new_tokens, token_budget)  # 此处为什么取二者较小值，考虑开启chunk-prefill时，num_new_tokens一般会很大，则会截取到token_budget进行计算（显存打满）
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -724,9 +1189,9 @@ class Scheduler(SchedulerInterface):
 
                 # todo 为request分配blocks
                 # request	当前待调度的请求
-                # num_new_tokens + num_external_computed_tokens	总共需要预留的 token slot 数
+                # num_new_tokens + num_external_computed_tokens	总共需要预留的 token slot 数 （该请求需要计算的token数 + 该请求需要从远端拉取的token数）
                 # • num_new_tokens：本次要计算的新 token
-                # • + num_external_computed_tokens：远程已匹配但需占位的 token（即使不计算，也要预留 block）
+                # • + num_external_computed_tokens：远程已匹配但需占位的 token（即使不计算，也要预留 block，等待异步传输到来，放在这里）
                 # num_new_local_computed_tokens	本地缓存复用的 token 数（用于跳过计算，但 block 已存在）
                 # new_computed_blocks	本地复用的 block 列表（来自 prompt caching）
                 # num_lookahead_tokens	推测解码（speculative decoding）所需的额外 token 预留
@@ -744,29 +1209,52 @@ class Scheduler(SchedulerInterface):
 
                 logger.warning(f'===== class Scheduler.schedule(), 分配blocks, new_blocks={new_blocks}')
 
-                if new_blocks is None:
+                if new_blocks is None:  # block分配失败，说明空间不足，停止组batch
                     # The request cannot be scheduled.
                     break
 
+                # 当前请求的本地blocks分配成功后，更新block_table，拉取远端blocks
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
+                    # update_state_after_alloc 是 Connector 模块（通常指 PrefixCachingKVCacheManager 或类似组件）的一个方法，职责是：
+                    # 将本次分配/加载的 KV blocks 合并到请求的 block table 中，并更新缓存元数据。
                     self.connector.update_state_after_alloc(
                         request,
                         new_computed_blocks + new_blocks,
                         num_external_computed_tokens,
                     )
 
+                # request从waiting队列弹出，此前只是 peek_request() 查看，block分配成功后，现在才真正移除。
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
-                request = self.waiting.pop_request()  # todo request从waiting队列弹出，此前只是 peek_request() 查看，block分配成功后，现在才真正移除。
-                if load_kv_async:
+                request = self.waiting.pop_request()
+                # 如果当前请求需要异步加载远程 KV Cache，则：
+                # 不进行实际计算
+                # 将其状态设为 WAITING_FOR_REMOTE_KVS
+                # 放回 waiting 队列头部（prepend）以便快速重试
+                # 跳过本轮调度的后续处理（continue）
+                if load_kv_async:  # 条件判断：当前请求是否正在 异步加载远程 KV Cache。load_kv_async 通常由前序逻辑设置，例如：检测到该请求的部分 KV blocks 存在于 CPU 内存（offloaded）；或在 分布式推理 中，KV 存储在其他节点。
+                    # 注释说明：此时会 分配 GPU 显存槽位（slots），但 不执行计算，只等待远程数据加载完成。
+                    # 注意：虽然注释说 “allocate memory”，但实际分配可能已在之前完成（如通过 allocate_slots 预留 block），此处重点是 状态切换。
+                    # 将请求 插入到 waiting 队列的头部（prepend），而不是尾部。
+                    # 为什么放头部？
+                    # 远程 KV 加载通常是 高优先级阻塞操作
+                    # 放头部可让该请求在 下一轮调度中优先被检查
+                    # 一旦 KV 加载完成，能立即进入 running 状态，减少延迟
+                    # ✅ 这是一种 “快速重试”策略，避免长延迟等待。
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
+                    # 显式设置请求状态为 WAITING_FOR_REMOTE_KVS
+                    # 作用：
+                    # 调度器后续轮次可根据此状态决定是否检查 KV 是否就绪
+                    # 防止重复触发加载逻辑
+                    # 便于监控和调试（如日志、metrics）
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    # todo 跳过本轮对该请求的后续处理（如 prefill/decode 计算），因为 KV 尚未就绪，无法安全执行前向计算。因为while循环中，优先判断请求状态是否为 WAITING_FOR_REMOTE_KVS，是则continue继续等待，直到传输完成。
                     continue
 
                 # 正常情况：加入 running 队列
@@ -776,19 +1264,49 @@ class Scheduler(SchedulerInterface):
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
+                '''
+                在 vLLM 的调度器（Scheduler） 中，处理 waiting 队列时使用两个列表：
+                scheduled_new_reqs
+                scheduled_resumed_reqs
+                是为了 区分两类语义和资源需求不同的请求，从而实现更精细的调度控制、性能优化和状态管理。
+                类型	                    含义	                                特点
+                scheduled_new_reqs	    全新请求
+                                        （首次进入系统，Prefill 尚未开始）	    - 需要完整 Prefill
+                                                                            - 无任何 KV Cache
+                                                                            - 可能命中 Prefix Cache
+                scheduled_resumed_reqs	已部分处理、被中断后恢复的请求
+                                        （如被抢占、Chunked Prefill 中间状态）	- 已有部分 KV Cache
+                                                                            - 只需继续 Prefill 剩余部分 或 进入 Decode
+                                                                            - 状态为 RESUMING
+                                                                            
+                                                                            
+                问题	                            答案
+                为什么用两个 list？	            因为 新请求 和 恢复请求 在资源需求、状态、处理逻辑上存在本质差异
+                不分开会怎样？	                    逻辑耦合、状态混乱、资源分配错误、性能下降
+                resumed_reqs 主要指什么？	        被 抢占（preempted）后恢复 的请求，状态为 RESUMING
+                Chunked Prefill 属于哪一类？	    通常仍走 new_reqs 路径（因其未被抢占，只是分块）
+                对用户有影响吗？	                ❌ 无感知，但提升了系统稳定性和调度效率             
+                
+                设计哲学：
+                “相同行为归为一类，不同行为分开处理” —— 这是构建高可靠调度系统的基本原则。   
+                通过这种分离，vLLM 能够同时高效支持 高吞吐新请求 和 低延迟恢复请求，兼顾性能与鲁棒性。                                                            
+                '''
                 if request.status == RequestStatus.WAITING:
-                    scheduled_new_reqs.append(request)  # 全新 prefill 请求
+                    scheduled_new_reqs.append(request)  # 全新 prefill 请求，blocks是空的，加入 scheduled_new_reqs（即 prefill_batch）
                 elif request.status == RequestStatus.PREEMPTED:
-                    scheduled_resumed_reqs.append(request)  # 被抢占后恢复的请求，后续构建 batch 时，可能对两类请求做不同处理（如 metrics 统计）
+                    scheduled_resumed_reqs.append(request)  # todo PREEMPTED状态是上面处理running时设置的，blocks也是空的，和WAITING状态有什么区别吗？          被抢占后恢复的请求，后续构建 batch 时，可能对两类请求做不同处理（如 metrics 统计）
                 else:
                     raise RuntimeError(
                         f"Invalid request status: {request.status}")
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
+
                 req_to_new_blocks[request.request_id] = (
                     self.kv_cache_manager.get_blocks(request.request_id))
+
                 num_scheduled_tokens[request.request_id] = num_new_tokens
+
                 token_budget -= num_new_tokens  # 扣减 token budget
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -824,13 +1342,16 @@ class Scheduler(SchedulerInterface):
             self.waiting.prepend_requests(skipped_waiting_requests)
 
         # Check if the scheduling constraints are satisfied.
-        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())  # 本轮调度需要新分配的tokens总数。num_scheduled_tokens 中包含 running batch 和 waiting batch 的请求
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
+        # scheduled_new_reqs：waiting队列中新请求
+        # scheduled_resumed_reqs：waiting队列中被抢占的请求
+        # scheduled_running_reqs：running队列中组batch的请求
         assert (len(scheduled_new_reqs) + len(scheduled_resumed_reqs) +
                 len(scheduled_running_reqs) <= len(self.running))
 
@@ -850,8 +1371,44 @@ class Scheduler(SchedulerInterface):
         new_reqs_data = [
             NewRequestData.from_request(
                 req, req_to_new_blocks[req.request_id].get_block_ids())
-            for req in scheduled_new_reqs
+            for req in scheduled_new_reqs  # scheduled_new_reqs waiting队列中新请求
         ]
+
+        '''
+        _make_cached_request_data 函数的作用是：为当前调度轮次（scheduling iteration）中所有被选中的请求，
+        预计算并缓存一批与模型执行（forward）相关的元数据和张量信息，以避免在 model_runner 中重复计算，提升性能。
+
+        ✅ 核心目的
+        将调度器（Scheduler）的调度结果 → 转换为 ModelRunner 所需的、可高效执行的中间表示（cached data）
+        
+        这是 调度器与执行引擎之间的关键桥梁。
+        
+        🔍 参数详解
+        参数	类型	含义
+        scheduled_running_reqs	        List[Request]	            当前正在运行的请求（包括 decode 和 chunked prefill）
+        scheduled_resumed_reqs	        List[Request]	            从 waiting 队列恢复的请求（如被抢占后 resume 的请求）
+                                                                    （注：在较新版本中，可能已合并到 running）
+        num_scheduled_tokens	        int                         本轮 batch 中总 token 数（用于分配 KV Cache 等）
+        scheduled_spec_decode_tokens	Optional[int]	            如果启用了 推测解码（Speculative Decoding），表示用于验证的 token 数
+        req_to_new_blocks	            Dict[Request, List[int]]	每个请求新分配的 PagedAttention block IDs（用于构建 block_tables）
+        
+        这些数据会被直接传给 ModelRunner.execute_model()，用于构造 CUDA kernel 输入。
+
+        ⚙️ 为什么需要“缓存”？
+        避免重复计算
+        Position IDs、block tables 等在调度后是确定的，提前算好避免在 GPU 启动前临时计算。
+        
+        解耦调度器与执行器
+        Scheduler 只负责逻辑调度，ModelRunner 只负责执行，中间通过 cached_reqs_data 传递数据。
+        
+        支持异步/批处理优化
+        所有元数据一次性准备好，便于后续张量化（如 torch.tensor(block_tables)）。
+        
+        该函数通常在 Scheduler.schedule() 的末尾 被调用，然后 LLMEngine 将 cached_reqs_data 传给 ModelRunner。
+        
+        问：为什么函数 _make_cached_request_data 的参数没有 scheduled_new_reqs ？
+        答：因为 scheduled_new_reqs 不需要缓存数据？待确认。
+        '''
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs,
             scheduled_resumed_reqs,
@@ -859,6 +1416,10 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens,
             req_to_new_blocks,
         )
+        # 本次调度完成，需要送给model进行推理的请求 scheduled_requests，分为三部分：
+        # scheduled_new_reqs：waiting队列中的新请求
+        # scheduled_resumed_reqs：waiting队列中被抢占的请求
+        # scheduled_running_reqs：running队列中组batch的请求
         scheduled_requests = (scheduled_new_reqs + scheduled_running_reqs +
                               scheduled_resumed_reqs)
         structured_output_request_ids, grammar_bitmask = (
@@ -866,10 +1427,10 @@ class Scheduler(SchedulerInterface):
                                      scheduled_spec_decode_tokens))
         # todo 构造SchedulerOutput，包含 running batch 和 waiting batch
         scheduler_output = SchedulerOutput(
-            scheduled_new_reqs=new_reqs_data,  # (1) 新请求数据（Prefill），即 prefill batch
-            scheduled_cached_reqs=cached_reqs_data,  # (2)缓存请求数据（Decode / Resumed），即 decode batch / resume batch
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            scheduled_new_reqs=new_reqs_data,  # (1) 新请求数据（Prefill），scheduled_new_reqs
+            scheduled_cached_reqs=cached_reqs_data,  # (2)缓存请求数据（Decode/chunk-prefill + Resumed），即上面 scheduled_running_reqs + scheduled_resumed_reqs
+            num_scheduled_tokens=num_scheduled_tokens,  # （1）和（2）加一起的tokens，按请求记录
+            total_num_scheduled_tokens=total_num_scheduled_tokens,  #  （1）和（2）加一起的token数
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
@@ -1149,7 +1710,7 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        sampled_token_ids = model_runner_output.sampled_token_ids
+        sampled_token_ids = model_runner_output.sampled_token_ids  # model一轮推理完，得到logits，对logits采样，得到token_id
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -1167,7 +1728,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
-        for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+        for req_id, num_tokens_scheduled in num_scheduled_tokens.items():  # todo num_scheduled_tokens？
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             if request is None:
@@ -1197,7 +1758,7 @@ class Scheduler(SchedulerInterface):
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted)
 
-            stopped = False
+            stopped = False  # stopped 表示该请求是否推理结束
             new_logprobs = None
             new_token_ids = generated_token_ids
             kv_transfer_params = None
@@ -1205,7 +1766,7 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
-                new_token_ids, stopped = self._update_request_with_output(
+                new_token_ids, stopped = self._update_request_with_output(  # todo 将推理新生成的token_ids追加到request中
                     request, new_token_ids)
 
             # Stop checking for pooler models.
@@ -1315,10 +1876,11 @@ class Scheduler(SchedulerInterface):
         # Append generated tokens and check for stop. Note that if
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
-        stopped = False
+        stopped = False  # stopped 表示该请求是否推理结束
         for num_new, output_token_id in enumerate(new_token_ids, 1):
             request.append_output_token_ids(output_token_id)
 
+            # 检查最后的token是否为eos或指定stop_token_ids
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
             stopped = check_stop(request, self.max_model_len)
@@ -1408,6 +1970,7 @@ class Scheduler(SchedulerInterface):
         waiting_requests_to_remove = []
         valid_requests = []
 
+        # 1、移除请求
         # First pass: collect requests to remove from queues
         for req_id in request_ids:
             request = self.requests.get(req_id)
@@ -1427,6 +1990,7 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
 
+        # 2、释放请求所占用的资源
         # Second pass: set status and free requests
         for request in valid_requests:
             request.status = finished_status

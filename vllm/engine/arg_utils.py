@@ -356,6 +356,7 @@ class EngineArgs:
     cpu_offload_gb: float = CacheConfig.cpu_offload_gb
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: Optional[int] = CacheConfig.kv_cache_memory_bytes
+    reserved_block_num: Optional[int] = CacheConfig.reserved_block_num
     max_num_batched_tokens: Optional[
         int] = SchedulerConfig.max_num_batched_tokens
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
@@ -363,6 +364,10 @@ class EngineArgs:
     long_prefill_token_threshold: int = \
         SchedulerConfig.long_prefill_token_threshold
     max_num_seqs: Optional[int] = SchedulerConfig.max_num_seqs
+    max_prefill_batch_size: Optional[int] = SchedulerConfig.max_prefill_batch_size
+    min_prefill_batch_size: Optional[int] = SchedulerConfig.min_prefill_batch_size
+    prefill_request_batching_timeout_ms: Optional[int] = SchedulerConfig.prefill_request_batching_timeout_ms
+    scheduler_delay_us: Optional[int] = SchedulerConfig.scheduler_delay_us
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
     disable_log_stats: bool = False
@@ -508,6 +513,51 @@ class EngineArgs:
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         """Shared CLI arguments for vLLM engine."""
+        import os, threading
+        logger.warning(f'===== EngineArgs.add_cli_args, pid={os.getpid()}, tid={threading.get_ident()}')
+
+        """获取完整的调用栈"""
+        import inspect
+        stack = inspect.stack()
+        stack_details = []
+
+        for frame_info in stack[1:]:  # 跳过当前函数
+            frame, filename, lineno, function, code_line, index = frame_info
+            stack_details.append({
+                'filename': filename,
+                'line_number': lineno,
+                'function': function,
+                'code_line': code_line
+            })
+        # logger.warning(f'===== all stack_details={stack_details}')
+        logger.warning(f'===== EngineArgs add_cli_args() stack_details={json.dumps(stack_details, indent=4)}')
+
+        '''
+        openai/api_server.py
+        main
+            make_arg_parser(parser)
+                AsyncEngineArgs.add_cli_args(parser)  # openai/cli_args.py 
+                    EngineArgs.add_cli_args(parser)  # arg_utils.py 
+        '''
+
+
+        '''
+        # 源码编译后，使用该命令启动 
+        python -m vllm.entrypoints.openai.api_server \
+               --model="Qwen3-8B-W8A8" \
+               --served-model-name qwen3_moe \
+               --gpu-memory-utilization 0.9 \
+               --max-num-seqs 768 \
+               --max-model-len 22528 \
+               --trust-remote-code \
+               --enforce-eager \
+               --distributed_executor_backend=mp \
+               --tensor-parallel-size 2 \
+               --port 8000 \
+                --enforce-eager \
+                --compilation-config '{"cudagraph_capture_sizes": [1]}' \
+                --scheduling-policy "sjf"
+        '''
 
         # Model arguments
         model_kwargs = get_kwargs(ModelConfig)
@@ -784,6 +834,8 @@ class EngineArgs:
                                  **cache_kwargs["mamba_cache_dtype"])
         cache_group.add_argument("--mamba-ssm-cache-dtype",
                                  **cache_kwargs["mamba_ssm_cache_dtype"])
+        cache_group.add_argument("--reserved-block-num",
+                                 **cache_kwargs["reserved_block_num"])
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)
@@ -914,6 +966,14 @@ class EngineArgs:
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"])
         scheduler_group.add_argument("--async-scheduling",
                                      **scheduler_kwargs["async_scheduling"])
+        scheduler_group.add_argument("--max-prefill-batch-size",
+                                     **scheduler_kwargs["max_prefill_batch_size"])
+        scheduler_group.add_argument("--min-prefill-batch-size",
+                                     **scheduler_kwargs["min_prefill_batch_size"])
+        scheduler_group.add_argument("--prefill-request-batching-timeout-ms",
+                                     **scheduler_kwargs["prefill_request_batching_timeout_ms"])
+        scheduler_group.add_argument("--scheduler-delay-us",
+                                     **scheduler_kwargs["scheduler_delay_us"])
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1116,6 +1176,119 @@ class EngineArgs:
 
         logger.warning(f'===== EngineArgs.create_engine_config 创建VllmConfig实例')
 
+        """获取完整的调用栈"""
+        import inspect
+        stack = inspect.stack()
+        stack_details = []
+
+        for frame_info in stack[1:]:  # 跳过当前函数
+            frame, filename, lineno, function, code_line, index = frame_info
+            stack_details.append({
+                'filename': filename,
+                'line_number': lineno,
+                'function': function,
+                'code_line': code_line
+            })
+        logger.warning(
+            f'===== EngineArgs.create_engine_config() stack_details={json.dumps(stack_details, indent=4)}')
+        '''
+        ==== EngineArgs.create_engine_config() stack_details=[
+           {
+               "filename": "/home/liudi/vllm/vllm/entrypoints/openai/api_server.py",
+               "line_number": 472,
+               "function": "build_async_engine_client_from_engine_args",
+               "code_line": [
+                   "    vllm_config = engine_args.create_engine_config(usage_context=usage_context)\n"
+               ]
+           },
+           {
+               "filename": "/usr/local/python3.11.13/lib/python3.11/contextlib.py",
+               "line_number": 210,
+               "function": "__aenter__",
+               "code_line": [
+                   "            return await anext(self.gen)\n"
+               ]
+           },
+           {
+               "filename": "/home/liudi/vllm/vllm/entrypoints/openai/api_server.py",
+               "line_number": 444,
+               "function": "build_async_engine_client",
+               "code_line": [
+                   "    async with build_async_engine_client_from_engine_args(\n"
+               ]
+           },
+           {
+               "filename": "/usr/local/python3.11.13/lib/python3.11/contextlib.py",
+               "line_number": 210,
+               "function": "__aenter__",
+               "code_line": [
+                   "            return await anext(self.gen)\n"
+               ]
+           },
+           {
+               "filename": "/home/liudi/vllm/vllm/entrypoints/openai/api_server.py",
+               "line_number": 2173,
+               "function": "run_server_worker",
+               "code_line": [
+                   "    async with build_async_engine_client(\n"
+               ]
+           },
+           {
+               "filename": "/home/liudi/vllm/vllm/entrypoints/openai/api_server.py",
+               "line_number": 2154,
+               "function": "run_server",
+               "code_line": [
+                   "    await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)\n"
+               ]
+           },
+           {
+               "filename": "/usr/local/python3.11.13/lib/python3.11/site-packages/uvloop/__init__.py",
+               "line_number": 61,
+               "function": "wrapper",
+               "code_line": [
+                   "            return await main\n"
+               ]
+           },
+           {
+               "filename": "/usr/local/python3.11.13/lib/python3.11/asyncio/runners.py",
+               "line_number": 118,
+               "function": "run",
+               "code_line": [
+                   "            return self._loop.run_until_complete(task)\n"
+               ]
+           },
+           {
+               "filename": "/usr/local/python3.11.13/lib/python3.11/site-packages/uvloop/__init__.py",
+               "line_number": 105,
+               "function": "run",
+               "code_line": [
+                   "                return runner.run(wrapper())\n"
+               ]
+           },
+           {
+               "filename": "/home/liudi/vllm/vllm/entrypoints/openai/api_server.py",
+               "line_number": 2226,
+               "function": "<module>",
+               "code_line": [
+                   "    uvloop.run(run_server(args))\n"
+               ]
+           },
+           {
+               "filename": "<frozen runpy>",
+               "line_number": 88,
+               "function": "_run_code",
+               "code_line": null
+           },
+           {
+               "filename": "<frozen runpy>",
+               "line_number": 198,
+               "function": "_run_module_as_main",
+               "code_line": null
+           }
+
+        '''
+        """"""""""""""""""""
+
         """
         Create the VllmConfig.
 
@@ -1207,6 +1380,7 @@ class EngineArgs:
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
+            reserved_block_num=self.reserved_block_num,
         )
 
         logger.warning(f'===== cache_config={cache_config}')
@@ -1367,11 +1541,79 @@ class EngineArgs:
         if speculative_config is not None:
             num_lookahead_slots = speculative_config.num_lookahead_slots
 
+        '''
+        1. max_model_len
+            🔹 含义：
+            模型支持的最大上下文长度（total tokens = prompt + output）
+            
+            单位：tokens
+            默认值：通常取自模型的 config.max_position_embeddings 或 max_sequence_length
+            例如：Llama-3-8B 的 max_model_len = 8192
+            🔹 作用：
+            硬性限制每个请求的总长度
+            如果用户 prompt 长度为 9000，而 max_model_len=8192 → 请求会被拒绝或截断（取决于实现）
+            影响 max_num_batched_tokens 的默认值（若未显式设置）
+            🔹 注意：
+            不直接影响 batch 大小，但间接限制了单个请求能占用的 token 数
+            在 PagedAttention 中，它决定了每个序列最多需要多少个 block
+        2.max_num_batched_tokens
+            🔹 含义：
+            一个 GPU 推理 batch 中允许的最大 token 总数（包括所有请求的 prompt + 已生成 token）
+    
+            单位：tokens
+            默认值：通常为 min(2048, max_model_len)（旧版本），新版本（v0.4+）常设为 max_model_len
+            示例：
+            设为 4096
+            若有 4 个请求，每个 prompt 长 1000 tokens → 总 token = 4000 < 4096 → ✅ 可调度
+            若第 5 个请求 prompt 长 200 → 4200 > 4096 → ❌ 无法加入当前 batch
+            🔹 作用：
+            控制 Prefill 和 Decode 的总并发 token 数
+            是 限制 Prefill Batch Size 的最关键参数
+            因为 Prefill 阶段要一次性处理整个 prompt，消耗大量显存
+            直接影响 吞吐量（throughput）
+            值越大 → 越能合并更多请求 → 吞吐越高（前提是显存足够）
+            🔹 重要特性：
+            动态分配：Prefill 和 Decode 共享这个 token budget
+            例如：batch 中已有 10 个 decode 请求（各占 1 token，共 10），则剩余 4086 token 可用于 prefill 新请求
+         3. max_num_seqs
+            🔹 含义：
+            一个 batch 中允许的最大请求数（sequence groups）
+            
+            单位：请求数（不是 token！）
+            默认值：256（常见）
+            示例：
+            设为 16
+            即使 max_num_batched_tokens=8192，也不能在一个 batch 中调度超过 16 个请求
+            🔹 作用：
+            防止极端情况下的调度爆炸
+            例如：1000 个超短 prompt（各 1 token）→ 若无此限制，会一次性调度 1000 个请求，导致 kernel 启动开销剧增
+            保护系统稳定性
+            过多的小请求会增加调度器、attention kernel 的 overhead
+            🔹 与 max_num_batched_tokens 的关系：
+            场景	限制因素
+            多个长 prompt（如 2000 tokens）	max_num_batched_tokens 主导
+            大量短 prompt（如 10 tokens）	max_num_seqs 主导
+            📌 两者是“AND”关系：必须同时满足！
+            
+        一个 batch 必须同时满足：
+        ┌──────────────────────────────┐
+        │ total_tokens ≤ max_num_batched_tokens │ ← 显存/计算量约束
+        ├──────────────────────────────┤
+        │ num_requests ≤ max_num_seqs           │ ← 调度开销约束
+        ├──────────────────────────────┤
+        │ each_request_len ≤ max_model_len      │ ← 模型能力约束
+        └──────────────────────────────┘
+        '''
+        # todo 这里创建 scheduler_config
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
-            max_num_batched_tokens=self.max_num_batched_tokens,
-            max_num_seqs=self.max_num_seqs,
-            max_model_len=model_config.max_model_len,
+            max_num_batched_tokens=self.max_num_batched_tokens,  # 一个 GPU 推理 batch 中允许的最大 token 总数（包括所有请求的 prompt + 已生成 token）
+            max_num_seqs=self.max_num_seqs,                      # 一个 batch 中允许的最大请求数（sequence groups）
+            max_model_len=model_config.max_model_len,            # 模型支持的最大上下文长度（total tokens = prompt + output）
+            max_prefill_batch_size=self.max_prefill_batch_size,
+            min_prefill_batch_size=self.min_prefill_batch_size,
+            prefill_request_batching_timeout_ms=self.prefill_request_batching_timeout_ms,
+            scheduler_delay_us=self.scheduler_delay_us,
             cuda_graph_sizes=self.cuda_graph_sizes,
             num_lookahead_slots=num_lookahead_slots,
             enable_chunked_prefill=self.enable_chunked_prefill,

@@ -211,6 +211,8 @@ class WorkerWrapperBase:
         if isinstance(self.vllm_config.parallel_config.worker_cls, str):
             worker_class = resolve_obj_by_qualname(
                 self.vllm_config.parallel_config.worker_cls)
+            # ===== init_worker 1, worker_class=<class 'vllm_ascend.worker.worker_v1.NPUWorker'>
+            logger.warning(f'===== init_worker 1, worker_class={worker_class}')
         else:
             logger.warning(
                 "passing worker_cls as a class object is strongly deprecated,"
@@ -222,9 +224,12 @@ class WorkerWrapperBase:
                               bytes)
             worker_class = cloudpickle.loads(
                 self.vllm_config.parallel_config.worker_cls)
+            logger.warning(f'===== init_worker 2, worker_class={worker_class}')
+
         if self.vllm_config.parallel_config.worker_extension_cls:
             worker_extension_cls = resolve_obj_by_qualname(
                 self.vllm_config.parallel_config.worker_extension_cls)
+            logger.warning(f'===== init_worker, worker_extension_cls={worker_extension_cls}')
             extended_calls = []
             if worker_extension_cls not in worker_class.__bases__:
                 # check any conflicts between worker and worker_extension_cls

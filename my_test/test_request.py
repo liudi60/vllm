@@ -10,7 +10,7 @@ def test_vllm_server():
         "messages": [
             {"role": "user", "content": "你好，请用中文回答：什么是机器学习？"}
         ],
-        "max_tokens": 200,
+        "max_tokens": 27,
         "temperature": 0.7,
         "top_p": 0.9,
         "stream": False

@@ -24,6 +24,9 @@ logger = init_logger(__name__)
 
 LoRADType = Literal["auto", "float16", "bfloat16"]
 
+# ===== lora.py, current_platform=<vllm_ascend.platform.NPUPlatform object at 0xfffdbd3a4190>
+logger.warning(f'===== lora.py, current_platform={current_platform}')
+
 
 @config
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))

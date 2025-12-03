@@ -389,6 +389,65 @@ class WorkerProc:
         shared_worker_lock: LockType,
     ):
         self.rank = rank
+        # ===== WorkerProc.__init__, local_rank=0, rank=0
+        # ===== WorkerProc.__init__, local_rank=1, rank=1
+        logger.warning(f'===== WorkerProc.__init__, local_rank={local_rank}, rank={rank}')
+        '''
+        ===== vllm_config=  model='Qwen3-8B-W8A8', 
+                            speculative_config=None, 
+                            tokenizer='Qwen3-8B-W8A8', 
+                            skip_tokenizer_init=False, 
+                            tokenizer_mode=auto, 
+                            revision=None, 
+                            tokenizer_revision=None, 
+                            trust_remote_code=True, 
+                            dtype=torch.bfloat16, 
+                            max_seq_len=22528, 
+                            download_dir=None, 
+                            load_format=auto, 
+                            tensor_parallel_size=2, 
+                            pipeline_parallel_size=1, 
+                            data_parallel_size=1, 
+                            disable_custom_all_reduce=True, 
+                            quantization=ascend, 
+                            enforce_eager=True, 
+                            kv_cache_dtype=auto, 
+                            device_config=npu, 
+                            structured_outputs_config=StructuredOutputsConfig(backend='auto', 
+                            disable_fallback=False, 
+                            disable_any_whitespace=False, 
+                            disable_additional_properties=False, 
+                            reasoning_parser=''), 
+                            observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, 
+                            otlp_traces_endpoint=None, 
+                            collect_detailed_traces=None), 
+                            seed=0, 
+                            served_model_name=qwen3_moe, 
+                            enable_prefix_caching=True, 
+                            chunked_prefill_enabled=True, 
+                            pooler_config=None, 
+                            compilation_config={"level":0,
+                                                "debug_dump_path":"",
+                                                "cache_dir":"",
+                                                "backend":"",
+                                                "custom_ops":["all"],
+                                                "splitting_ops":null,
+                                                "use_inductor":true,
+                                                "compile_sizes":[],
+                                                "inductor_compile_config":{"enable_auto_functionalized_v2":false},
+                                                "inductor_passes":{},
+                                                "cudagraph_mode":0,
+                                                "use_cudagraph":true,
+                                                "cudagraph_num_of_warmups":1,
+                                                "cudagraph_capture_sizes":[1],
+                                                "cudagraph_copy_inputs":false,
+                                                "full_cuda_graph":false,
+                                                "use_inductor_graph_partition":false,
+                                                "pass_config":{},
+                                                "max_capture_size":1,
+                                                "local_cache_dir":null}
+        '''
+        logger.warning(f'===== vllm_config={vllm_config}')
         wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -526,11 +585,225 @@ class WorkerProc:
         destroy_model_parallel()
         destroy_distributed_environment()
 
-    # worker线程的执行体
+
+    '''
+    worker线程的执行体
+    
+    主进程                          Worker 子进程
+   │                                │
+   │── fork + 传 ready_pipe  ──────▶│
+   │                                │
+   │                                ├─ 加载模型
+   │                                ├─ 初始化 MQ
+   │◀── send(READY + MQ handle)  ───┤
+   │                                │
+   │── wait MQ ready  ─────────────▶│
+   │                                ├─ wait MQ ready
+   │                                │
+   │── send(execute_model)  ───────▶│
+   │                                ├─ 执行 forward
+   │◀── recv(logits)  ──────────────┤
+   │                                │
+   │── send(shutdown)  ────────────▶│
+   │                                ├─ exit busy_loop
+   │                                └─ 进程退出
+    '''
     @staticmethod
     def worker_main(*args, **kwargs):
         """ Worker initialization and execution loops.
         This runs a background process """
+
+        logger.warning(f'===== worker_main begin， args={args}')
+        '''
+        ===== kwargs={'vllm_config': VllmConfig(model_config=ModelConfig(   model='Qwen3-8B-W8A8', 
+                                                                            runner='auto', 
+                                                                            convert='auto', 
+                                                                            task=None, 
+                                                                            tokenizer='Qwen3-8B-W8A8', 
+                                                                            tokenizer_mode='auto', 
+                                                                            trust_remote_code=True, 
+                                                                            dtype=torch.bfloat16, 
+                                                                            seed=0, 
+                                                                            hf_config_path=None, 
+                                                                            allowed_local_media_path='', 
+                                                                            allowed_media_domains=None, 
+                                                                            revision=None, 
+                                                                            code_revision=None, 
+                                                                            rope_scaling={}, 
+                                                                            rope_theta=None, 
+                                                                            tokenizer_revision=None, 
+                                                                            max_model_len=22528, 
+                                                                            spec_target_max_model_len=None, 
+                                                                            quantization='ascend', 
+                                                                            enforce_eager=True, 
+                                                                            max_logprobs=20, 
+                                                                            logprobs_mode='raw_logprobs', 
+                                                                            disable_sliding_window=False, 
+                                                                            disable_cascade_attn=False, 
+                                                                            skip_tokenizer_init=False, 
+                                                                            enable_prompt_embeds=False, 
+                                                                            served_model_name='qwen3_moe', 
+                                                                            config_format='auto', 
+                                                                            hf_token=None, 
+                                                                            hf_overrides={}, 
+                                                                            logits_processor_pattern=None, 
+                                                                            generation_config='auto', 
+                                                                            override_generation_config={}, 
+                                                                            enable_sleep_mode=False, 
+                                                                            model_impl='auto', 
+                                                                            override_attention_dtype=None, 
+                                                                            logits_processors=None, 
+                                                                            io_processor_plugin=None, 
+                                                                            pooler_config=None, 
+                                                                            override_pooler_config=None, 
+                                                                            multimodal_config=None), 
+                                                                            cache_config=CacheConfig(block_size=128, 
+                                                                            gpu_memory_utilization=0.9, 
+                                                                            swap_space=4.0, 
+                                                                            cache_dtype='auto', 
+                                                                            is_attention_free=False, 
+                                                                            num_gpu_blocks_override=None, 
+                                                                            sliding_window=None, 
+                                                                            enable_prefix_caching=True, 
+                                                                            prefix_caching_hash_algo='sha256', 
+                                                                            cpu_offload_gb=0.0, 
+                                                                            calculate_kv_scales=False, 
+                                                                            cpu_kvcache_space_bytes=None, 
+                                                                            mamba_page_size_padded=None, 
+                                                                            mamba_cache_dtype='auto', 
+                                                                            mamba_ssm_cache_dtype='auto', 
+                                                                            num_gpu_blocks=None, 
+                                                                            num_cpu_blocks=None, 
+                                                                            kv_sharing_fast_prefill=False, 
+                                                                            kv_cache_memory_bytes=None), 
+                                                                            parallel_config=ParallelConfig( pipeline_parallel_size=1, 
+                                                                                                            tensor_parallel_size=2, 
+                                                                                                            data_parallel_size=1, 
+                                                                                                            data_parallel_size_local=1, 
+                                                                                                            data_parallel_rank=0, 
+                                                                                                            data_parallel_rank_local=0, 
+                                                                                                            data_parallel_master_ip='127.0.0.1', 
+                                                                                                            data_parallel_rpc_port=29550, 
+                                                                                                            data_parallel_master_port=0, 
+                                                                                                            data_parallel_backend='mp', 
+                                                                                                            data_parallel_external_lb=False, 
+                                                                                                            data_parallel_hybrid_lb=False, 
+                                                                                                            enable_expert_parallel=False, 
+                                                                                                            enable_eplb=False, 
+                                                                                                            eplb_config=EPLBConfig( window_size=1000, 
+                                                                                                                                    step_interval=3000, 
+                                                                                                                                    num_redundant_experts=0, 
+                                                                                                                                    log_balancedness=False), 
+                                                                                                            expert_placement_strategy='linear', 
+                                                                                                            num_redundant_experts=None, 
+                                                                                                            eplb_window_size=None, 
+                                                                                                            eplb_step_interval=None, 
+                                                                                                            eplb_log_balancedness=None, 
+                                                                                                            max_parallel_loading_workers=None, 
+                                                                                                            disable_custom_all_reduce=True, 
+                                                                                                            enable_dbo=False, 
+                                                                                                            dbo_decode_token_threshold=32, 
+                                                                                                            dbo_prefill_token_threshold=512, 
+                                                                                                            ray_workers_use_nsight=False, 
+                                                                                                            ray_runtime_env=None, 
+                                                                                                            placement_group=None, 
+                                                                                                            distributed_executor_backend='mp', 
+                                                                                                            worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', 
+                                                                                                            sd_worker_cls='auto', 
+                                                                                                            worker_extension_cls='', 
+                                                                                                            world_size=2, 
+                                                                                                            rank=0, 
+                                                                                                            _data_parallel_master_port_list=[], 
+                                                                                                            decode_context_parallel_size=1, 
+                                                                                                            _api_process_count=1, 
+                                                                                                            _api_process_rank=0), 
+                                                                            scheduler_config=SchedulerConfig(runner_type='generate', 
+                                                                            max_num_batched_tokens=2048, 
+                                                                            max_num_seqs=768, 
+                                                                            max_model_len=22528, 
+                                                                            max_num_partial_prefills=1, 
+                                                                            max_long_partial_prefills=1, 
+                                                                            long_prefill_token_threshold=0, 
+                                                                            num_lookahead_slots=0, 
+                                                                            cuda_graph_sizes=[512], 
+                                                                            enable_chunked_prefill=True, 
+                                                                            is_multimodal_model=False, 
+                                                                            max_num_encoder_input_tokens=2048, 
+                                                                            encoder_cache_size=2048, 
+                                                                            send_delta_data=False, 
+                                                                            policy='sjf', 
+                                                                            chunked_prefill_enabled=True, 
+                                                                            disable_chunked_mm_input=False, 
+                                                                            scheduler_cls='vllm.v1.core.sched.scheduler.Scheduler', 
+                                                                            disable_hybrid_kv_cache_manager=False, 
+                                                                            async_scheduling=False, 
+                                                                            max_prefill_batch_size=0, 
+                                                                            min_prefill_batch_size=2, 
+                                                                            prefill_request_batching_timeout_ms=10000, 
+                                                                            scheduler_delay_us=1000000), 
+                                                                            device_config=DeviceConfig(device=device(type='npu'), 
+                                                                            device_type='npu'), 
+                                                                            load_config=LoadConfig(load_format='auto', 
+                                                                            download_dir=None, 
+                                                                            safetensors_load_strategy='lazy', 
+                                                                            model_loader_extra_config={}, 
+                                                                            device=None, 
+                                                                            ignore_patterns=['original/**/*'], 
+                                                                            use_tqdm_on_load=True, 
+                                                                            pt_load_map_location='cpu'), 
+                                                                            lora_config=None, 
+                                                                            speculative_config=None, 
+                                                                            structured_outputs_config=StructuredOutputsConfig(backend='auto', 
+                                                                            disable_fallback=False, 
+                                                                            disable_any_whitespace=False, 
+                                                                            disable_additional_properties=False, 
+                                                                            reasoning_parser=''), 
+                                                                            observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, 
+                                                                            otlp_traces_endpoint=None, 
+                                                                            collect_detailed_traces=None), 
+                                                                            quant_config=AscendQuantConfig: <vllm_ascend.quantization.quant_config.AscendQuantConfig object at 0xffff2df76d10>, 
+                                                                            compilation_config={"level":0,
+                                                                            "debug_dump_path":"",
+                                                                            "cache_dir":"",
+                                                                            "backend":"",
+                                                                            "custom_ops":["all"],
+                                                                            "splitting_ops":null,
+                                                                            "use_inductor":true,
+                                                                            "compile_sizes":[],
+                                                                            "inductor_compile_config":{"enable_auto_functionalized_v2":false},
+                                                                            "inductor_passes":{},
+                                                                            "cudagraph_mode":0,
+                                                                            "use_cudagraph":true,
+                                                                            "cudagraph_num_of_warmups":1,
+                                                                            "cudagraph_capture_sizes":[1],
+                                                                            "cudagraph_copy_inputs":false,
+                                                                            "full_cuda_graph":false,
+                                                                            "use_inductor_graph_partition":false,
+                                                                            "pass_config":{},
+                                                                            "max_capture_size":1,
+                                                                            "local_cache_dir":null}, 
+                                                                            kv_transfer_config=None, 
+                                                                            kv_events_config=None, 
+                                                                            additional_config={}, 
+                                                                            instance_id='db235'), 
+                                                                            'local_rank': 0, 
+                                                                            'rank': 0, 
+                                                                            'distributed_init_method': 'tcp://127.0.0.1:48993', 
+                                                                            'input_shm_handle': Handle(local_reader_ranks=[0, 
+                                                                            1], 
+                                                                            buffer_handle=(2, 
+                                                                            16777216, 
+                                                                            10, 
+                                                                            'psm_d555c7d0'), 
+                                                                            local_subscribe_addr='ipc:///tmp/5b9f3a20-dfa1-440b-b93f-6bdcdb2c1fc8', 
+                                                                            remote_subscribe_addr=None, 
+                                                                            remote_addr_ipv6=False), 
+                                                                            'ready_pipe': (<multiprocessing.connection.Connection object at 0xffff2df2e310>, 
+                                                                            <multiprocessing.connection.Connection object at 0xffff2df2e1d0>), 
+                                                                            'death_pipe': <multiprocessing.connection.Connection object at 0xffff2df2df90>, 
+                                                                            'shared_worker_lock': <Lock(owner=None)>}
+        '''
+        logger.warning(f'===== kwargs={kwargs}')
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
@@ -547,11 +820,43 @@ class WorkerProc:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
+        '''
+        这段代码来自 vLLM 的多进程（multiprocessing）worker 初始化逻辑，其核心目的是：
+        让子进程（worker）能够监听主进程（parent）是否意外退出，并在主进程崩溃时自动终止自己，避免“孤儿 worker”残留。
+        这是 健壮的多进程系统中常见的“父进程死亡监控”机制。
+        
+        '''
         worker = None
+        '''
+        获取用于同步的管道（Pipe）
+        📌 关键概念：multiprocessing.Pipe()
+        Pipe() 创建一对 双向连接对象 (conn1, conn2)，用于进程间通信（IPC）。
+        数据写入一端，可从另一端读出。
+        参数说明：
+        变量	作用
+        ready_pipe	主进程 ← worker 通知“我已启动就绪”
+        - worker 持有 ready_writer（写端）
+        - 主进程持有 reader（读端）
+        death_pipe	主进程 → worker 通知“我挂了”
+        - 主进程持有写端
+        - worker 持有 death_pipe（读端）
+        💡 注意：death_pipe 是 主进程创建并传给子进程的读端。当主进程退出时，操作系统会自动关闭其所有文件描述符（包括 pipe 写端），导致子进程读端收到 EOF。
+        '''
         # tuple[Connection, Connection]
         reader, ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
+        # 创建 shutdown 事件
+        # 一个线程安全的信号量，用于通知主工作线程优雅退出。
+        # 初始状态为 False，调用 .set() 后变为 True。
         shutdown_event = threading.Event()
+        '''
+        启动“父进程死亡监控线程”
+        🧠 核心原理：
+        正常情况：主进程 alive → death_pipe 写端 open → recv() 永远阻塞。
+        主进程崩溃/退出：操作系统关闭其所有 FD → death_pipe 写端关闭 → 子进程 recv() 立即抛出 EOFError。
+        子进程响应：捕获异常 → 记录日志 → 设置 shutdown_event → 通知主循环退出。
+        ✅ 这是一种 无需轮询、零开销 的父进程存活检测机制。
+        '''
         # Start death monitoring thread if death_pipe is provided
         if death_pipe is not None:
 
@@ -573,10 +878,44 @@ class WorkerProc:
             death_monitor.start()
 
         try:
+            '''
+            reader 是 ready_pipe 的读端（由主进程持有，用于接收 worker 的就绪信号）
+            但 worker 拿到的是写端 ready_writer，读端 reader 对它无用
+            关闭无用的 FD（文件描述符），避免资源泄漏
+            💡 提醒：ready_pipe = (reader, ready_writer)，其中：
+            
+            主进程持 reader（读）
+            Worker 持 ready_writer（写）
+            '''
             reader.close()
+            '''
+            进入主工作循环处理推理请求
+            创建 WorkerProc 实例
+                WorkerProc 是 vLLM 中封装 模型加载、KV Cache、RPC 通信 的核心类
+            此步骤会：
+            加载 HuggingFace 模型（AutoModelForCausalLM.from_pretrained）
+                初始化 tokenizer（可选）
+                创建 PagedAttention KV Cache（BlockSpaceManager）
+                初始化两个关键的消息队列（Message Queue）：
+                worker_response_mq：用于向主进程返回结果
+                rpc_broadcast_mq：用于接收主进程的广播指令（如 shutdown）
+                ⚠️ 这是最耗时的步骤（GPU 显存分配、模型加载）
+            '''
             # 创建worker，
             worker = WorkerProc(*args, **kwargs)
 
+            '''
+            通知主进程：“我准备好了！”
+            📌 为什么需要这个？
+            主进程在启动所有 worker 后，会 阻塞等待每个 worker 发送“READY”信号
+            只有全部就绪，才开始调度请求，避免 race condition
+            📥 发送的内容：
+            字段	说明
+            "status"	固定值 "READY"，表示初始化成功
+            "handle"	消息队列的共享内存句柄（用于跨进程通信）
+            主进程用它重建 MQ 的本地代理
+            💡 export_handle() 是基于 multiprocessing 的 SharedMemory 或 Queue 的底层机制，允许主进程“连接”到 worker 的响应队列。
+            '''
             # Send READY once we know everything is loaded
             ready_writer.send({
                 "status":
@@ -585,13 +924,56 @@ class WorkerProc:
                 worker.worker_response_mq.export_handle(),
             })
 
+            '''
+            等待消息队列就绪（关键同步点！）
+            ❗ 为什么必须等？
+            消息队列（MQ）底层可能使用 共享内存 + 信号量，需要双方都初始化完成才能通信
+            如果顺序颠倒（先 close ready_writer 再 wait）会导致死锁！
+            主进程可能在收到 READY 后立即尝试发 RPC 指令
+            但 worker 的 MQ 还没 ready → 指令丢失或阻塞
+            ✅ 注释中强调：
+            
+            “Must be kept consistent with the Executor”
+            
+            → 主进程的 MultiprocessingExecutor 必须按相同顺序操作 MQ
+            '''
+            '''
+            在 vLLM 的多进程（multiprocessing）架构 中，worker.rpc_broadcast_mq 和 worker.worker_response_mq 是两个关键的 
+            跨进程消息队列（Message Queue, MQ），用于 主进程（driver）与子进程（worker）之间的高效、低延迟通信。
+
+            它们共同构成了 vLLM 多进程执行器（如 MultiprocessingExecutor）的 命令-响应（Request-Reply）通信模型。
+            
+            🧠 核心作用对比
+            消息队列	            方向	            用途	                数据内容
+            rpc_broadcast_mq	主进程 → Worker	下发指令（RPC 调用）	execute_model, abort_request, shutdown 等命令 + 参数
+            worker_response_mq	Worker → 主进程	返回结果（响应）	    模型输出 logits / 采样 token / 错误信息
+            
+            💡 可以理解为：
+            rpc_broadcast_mq = “老板给工人派活”
+            worker_response_mq = “工人干完活交差”
+            '''
             # Ensure message queues are ready. Will deadlock if re-ordered.
             # Must be kept consistent with the Executor
             worker.rpc_broadcast_mq.wait_until_ready()
             worker.worker_response_mq.wait_until_ready()
+            # 清理 ready_writer
+            # 任务已完成（就绪信号已发送），关闭写端，释放资源
+            # 设为 None 避免误用
             ready_writer.close()
             ready_writer = None
 
+            '''
+            # 进入主工作循环
+            🔄 worker_busy_loop 做什么？
+            无限循环监听 RPC 指令（来自 rpc_broadcast_mq）
+            支持的指令包括：
+            "execute_model"：执行前向计算
+            "abort_request"：取消请求
+            "shutdown"：退出循环
+            如果 shutdown_event 被触发（如父进程死亡监控线程调用 .set()），则优雅退出
+            💡 这是 worker 的“一生”：从就绪 → 处理请求 → 收到 shutdown → 退出
+            '''
+            logger.warning(f'===== worker.worker_busy_loop...')
             worker.worker_busy_loop(cancel=shutdown_event)
 
         except Exception:
@@ -661,6 +1043,33 @@ class WorkerProc:
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 cancel=cancel, indefinite=True)
+            '''
+            ===== method=execute_model
+            ===== args=(SchedulerOutput(scheduled_new_reqs=[], 
+                        scheduled_cached_reqs=CachedRequestData(
+                            req_ids=['chatcmpl-826c652e53d4482586d8ce63664a559f'], 
+                            resumed_from_preemption=[False], 
+                            new_token_ids=[], 
+                            new_block_ids=[None], 
+                            num_computed_tokens=[42]), 
+                            num_scheduled_tokens={'chatcmpl-826c652e53d4482586d8ce63664a559f': 1}, 
+                            total_num_scheduled_tokens=1, 
+                            scheduled_spec_decode_tokens={}, 
+                            scheduled_encoder_inputs={}, 
+                            num_common_prefix_blocks=[1], 
+                            finished_req_ids=set(), 
+                            free_encoder_mm_hashes=[], 
+                            structured_output_request_ids={}, 
+                            grammar_bitmask=None, 
+                            kv_connector_metadata=None),)
+            ===== kwargs={}
+            ===== output_rank=0
+            '''
+            logger.warning(f'===== worker_busy_loop, self.rpc_broadcast_mq.dequeue')
+            logger.warning(f'===== method={method}')
+            logger.warning(f'===== args={args}')
+            logger.warning(f'===== kwargs={kwargs}')
+            logger.warning(f'===== output_rank={output_rank}')
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
@@ -670,6 +1079,8 @@ class WorkerProc:
                 if self.mm_receiver_cache is not None \
                     and func.__name__ == "execute_model":
                     get_and_update_mm_cache(self.mm_receiver_cache, args)
+                # ===== func=<bound method NPUWorker.execute_model of <vllm_ascend.worker.worker_v1.NPUWorker object at 0xffff1384c750>>
+                logger.warning(f'===== func={func}')
                 output = func(*args, **kwargs)
             except Exception as e:
                 # Notes have been introduced in python 3.11

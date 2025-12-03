@@ -48,6 +48,27 @@ def check_stop(request: Request,
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED
         return True
 
+    '''
+    ✅ 1. request.pooling_params 是什么？
+    这是一个可选字段，表示该请求不是用于生成文本，而是用于获取句子/文本的 embedding 向量。
+    它对应 vLLM 中的 PoolingParams 类型（或类似结构），包含：
+    pooling_type: 如 mean, cls, last 等
+    是否需要归一化等参数
+    💡 这类请求常见于 embedding 模型（如 BAAI/bge-small-en、sentence-transformers 系列），它们没有“生成 token”的过程，而是在 prefill 阶段结束后直接通过 pooler 层输出一个向量。
+    
+    ✅ 2. pooler_output is not None 是什么意思？
+    在模型执行 execute_model 后，如果模型支持 pooling（如 transformers 中的 BertModel、RobertaModel 带 pooler 层），vLLM 会尝试提取 pooler_output。
+    对于 纯 decoder 模型（如 Llama），通常没有 pooler_output，所以为 None。
+    但对于 encoder-only 或 encoder-decoder 模型用于 embedding 任务，pooler_output 会在 prefill 完成后立即生成。
+    ✅ 所以：pooler_output is not None 表示 模型已经成功计算出 embedding 向量。
+    
+    ✅ 3. 为什么此时标记为 FINISHED_STOPPED？
+    对于 pooling 请求：
+    不需要 decode 生成新 token
+    prefill 完成就等于整个推理完成
+    因此，一旦拿到 pooler_output，就应立即将请求状态设为 已完成（FINISHED_STOPPED），并返回结果。
+    📝 注意：虽然叫 STOPPED，但这里并不是因为遇到 stop token，而是“任务自然结束”。vLLM 复用了这个状态枚举。
+    '''
     if request.pooling_params:
         if pooler_output is not None:
             request.status = RequestStatus.FINISHED_STOPPED

@@ -654,6 +654,10 @@ def tensorize_vllm_model(engine_args: "EngineArgs",
        Intended to be used separately from running a vLLM server since it
        creates its own Engine instance.
     """
+    logger.warning(f'===== engine_args.create_engine_config()')
+    # 没走这里
+
+
     engine_config = engine_args.create_engine_config()
     tensorizer_config.verify_with_model_config(engine_config.model_config)
     tensorizer_config.verify_with_parallel_config(

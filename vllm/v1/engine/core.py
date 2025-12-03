@@ -248,6 +248,10 @@ class EngineCore:
         elapsed = time.time() - start
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
+
+        logger.warning(f'===== _initialize_kv_caches, scheduler_kv_cache_config={scheduler_kv_cache_config}')
+        logger.warning(f'===== vllm_config.cache_config={vllm_config.cache_config}')
+        scheduler_kv_cache_config.reserved_block_num = vllm_config.cache_config.reserved_block_num
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
@@ -327,6 +331,7 @@ class EngineCore:
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
+        # 此处释放推理结束的request资源
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
 
@@ -783,19 +788,28 @@ class EngineCoreProc(EngineCore):
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
+        '''
+        循环条件（只有满足以下全部条件才进入等待）：
+            not self.engines_running            → 引擎尚未启动完成（或处于 idle 状态）
+            not self.scheduler.has_requests()   → 调度器内部没有待处理的请求（waiting / running 队列都为空）
+            not self.batch_queue                → 批处理队列（可能用于异步 batch 提交）也为空
+            💡 这个 while 循环的本质是：当系统完全空闲时，阻塞等待新请求到来。
+            但注意：一旦任一条件变为 False（比如有请求来了），就退出循环，开始处理请求。
+        '''
         waited = False
         while not self.engines_running and not self.scheduler.has_requests() \
-                and not self.batch_queue:
+                and not self.batch_queue:  # 系统空闲
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
-            req = self.input_queue.get()
+            req = self.input_queue.get()  # 系统空闲，则阻塞等待请求到来
             logger.warning(f'===== self.input_queue.get()={req}')
             self._handle_client_request(*req)  # 向scheduler的waiting队列添加请求
 
         if waited:
             logger.debug("EngineCore loop active.")
 
+        # 到这里，系统不在空闲。取出 input_queue 中全部请求
         # Handle any more client requests.
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
@@ -820,24 +834,57 @@ class EngineCoreProc(EngineCore):
                                request: Any) -> None:
         """Dispatch request from client."""
 
-        if request_type == EngineCoreRequestType.ADD:
+        if request_type == EngineCoreRequestType.ADD:  # todo EngineCoreRequestType.ADD → 添加新推理请求
+            '''
+            客户端提交了一个 新的文本生成请求（如 generate(prompt, sampling_params)）
+            客户端提交了一个 新的文本生成请求（如 generate(prompt, sampling_params)）
+            request 是一个元组：(req, request_wave)
+            req: Request 对象，包含 prompt, sampling_params, request_id 等
+            request_wave: 可能用于 流式输出（streaming）的波次控制 或 多阶段请求标识（在部分定制版 vLLM 中用于支持复杂交互）
+            '''
             req, request_wave = request
             self.add_request(req, request_wave)  # req加入waiting队列
-        elif request_type == EngineCoreRequestType.ABORT:
+        elif request_type == EngineCoreRequestType.ABORT:  # todo EngineCoreRequestType.ABORT → 取消请求
+            '''
+            📌 含义：
+                客户端要求 取消一个或多个正在运行的请求
+                request 通常是 要取消的 request_id 列表（如 ["req-1", "req-2"]）
+            🧠 self.abort_requests() 做了什么？
+                从 running / waiting / swapped 队列中移除对应请求
+                释放其占用的 KV Cache blocks（通过 BlockSpaceManager.free()）
+                标记请求为 finished = True，避免后续处理
+            ⚠️ 注意：已生成的部分 token 不会回滚，但后续不再继续生成。
+            '''
             self.abort_requests(request)
-        elif request_type == EngineCoreRequestType.UTILITY:
+        elif request_type == EngineCoreRequestType.UTILITY:  #  todo EngineCoreRequestType.UTILITY → 工具类调用（非推理）
+            '''
+            📌 含义：
+                客户端发起一个 非生成式操作，例如：
+                获取模型信息（get_model_config()）
+                查询当前负载（get_stats()）
+                动态更新配置（set_sampling_params(...)）
+                心跳检测（ping()）
+            📥 参数解释：
+                变量	        说明
+                client_idx	客户端索引（多客户端场景下用于路由响应）
+                call_id	    调用唯一 ID（用于匹配请求与响应）
+                method_name	要调用的方法名（字符串，如 "get_tokenizer"）
+                args	    方法参数（元组或字典）
+                
+            这类请求 不经过调度器，直接由 EngineCore 同步执行，用于管理/监控。
+            '''
             client_idx, call_id, method_name, args = request
             output = UtilityOutput(call_id)
             try:
                 method = getattr(self, method_name)
-                result = method(*self._convert_msgspec_args(method, args))
+                result = method(*self._convert_msgspec_args(method, args))  # 同步回调工具函数
                 output.result = UtilityResult(result)
             except BaseException as e:
                 logger.exception("Invocation of %s method failed", method_name)
                 output.failure_message = (f"Call to {method_name} method"
                                           f" failed: {str(e)}")
             self.output_queue.put_nowait(
-                (client_idx, EngineCoreOutputs(utility_output=output)))
+                (client_idx, EngineCoreOutputs(utility_output=output)))  # 同步调用工具函数的结果，同步放到 output_queue 中
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
             raise RuntimeError("Executor failed.")
         else:

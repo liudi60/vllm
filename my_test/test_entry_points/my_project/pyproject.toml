@@ -1,0 +1,27 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-package"
+version = "0.1.0"
+# ... 其他元数据
+
+
+# 1. 命令行脚本（console_scripts）
+# 注册 entry_points
+[project.entry-points.console_scripts]
+mycli = "mypackage.cli:main"
+mytool = "mypackage.tools:run"
+
+
+# 2. 自定义插件组（例如支持多种渲染器）
+[project.entry-points.myapp_renderers]
+myjson = "mypackage.renderers:JSONRenderer"
+myyaml = "mypackage.renderers:YAMLRenderer"
+
+
+# 3. 设备后端示例（如 vLLM 扩展）
+[project.entry-points.vllm_workers]
+mynpu = "mypackage.vllm_ascend.worker:AscendWorker.init"
