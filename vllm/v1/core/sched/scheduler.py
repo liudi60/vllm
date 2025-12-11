@@ -622,7 +622,8 @@ class Scheduler(SchedulerInterface):
 
             while True:
                 # 1、尝试为请求分配物理block
-                # todo
+                # todo 此处，如果request中blocks预分配了，allocate_slots函数中返回什么？
+                logger.warning(f'===== schedule waiting, self.kv_cache_manager.allocate_slots, num_new_tokens={num_new_tokens}, request={request}')
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1106,8 +1107,8 @@ class Scheduler(SchedulerInterface):
                     持久化保存，不需要通过 new_computed_blocks 传递。
                     '''
                     new_computed_blocks = (
-                        self.kv_cache_manager.create_empty_block_list())  # todo 这里怎么是空的？chunk-prefill之前的算的block不需要记录下来吗？答：本次chunk的计算不需要知道前面chunk算出来的blocks，所以new_computed_blocks是空的，前面算出来的blocks已经存在block_table中了。
-                    num_new_local_computed_tokens = 0  # todo 这个是？ 该请求本地已计算的token数。注意：new_computed_blocks 和 num_new_local_computed_tokens 保持一致。
+                        self.kv_cache_manager.create_empty_block_list())  # todo 这里怎么是空的？waiting队列中，非新请求，prefix-cache匹配的blocks就是空的
+                    num_new_local_computed_tokens = 0  # todo 这个是？ num_new_local_computed_tokens 表示prefix-cache匹配到的token数。new_computed_blocks 和 num_new_local_computed_tokens 保持一致。
                     num_computed_tokens = request.num_computed_tokens  # 该请求总共已计算的token数。这里 request.num_computed_tokens 就是前面chunk已经算完的token数量
 
                 encoder_inputs_to_schedule = None
@@ -1153,7 +1154,7 @@ class Scheduler(SchedulerInterface):
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
-                    num_new_tokens = min(num_new_tokens, token_budget)  # 此处为什么取二者较小值，考虑开启chunk-prefill时，num_new_tokens一般会很大，则会截取到token_budget进行计算（显存打满）
+                    num_new_tokens = min(num_new_tokens, token_budget)  # 此处为什么取二者较小值，考虑开启chunk-prefill时，num_new_tokens一般会很大，则会截取到token_budget进行计算
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -1187,7 +1188,7 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
-                # todo 为request分配blocks
+                # 为request分配blocks
                 # request	当前待调度的请求
                 # num_new_tokens + num_external_computed_tokens	总共需要预留的 token slot 数 （该请求需要计算的token数 + 该请求需要从远端拉取的token数）
                 # • num_new_tokens：本次要计算的新 token
@@ -1199,19 +1200,22 @@ class Scheduler(SchedulerInterface):
                 # num_encoder_tokens	encoder-decoder 模型所需的 cross-attention block 数
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
+                    num_new_tokens + num_external_computed_tokens,  # 本次推理新产生的token数 + 远程缓存命中的token数（需要分配出来，等待异步拉取填充）
+                    num_new_local_computed_tokens,  # 本地缓存命中的token数
+                    new_computed_blocks,  # 本地缓存命中的blocks。num_new_local_computed_tokens 和 new_computed_blocks 是一致的。
                     num_lookahead_tokens=effective_lookahead_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                 )
 
-                logger.warning(f'===== class Scheduler.schedule(), 分配blocks, new_blocks={new_blocks}')
+                logger.warning(f'===== class Scheduler.schedule(), 分配blocks, sum([len(b) for b in new_blocks.blocks])={sum([len(b) for b in new_blocks.blocks])}')
+                logger.warning(f'===== [len(b) for b in new_blocks.blocks]={[len(b) for b in new_blocks.blocks]}')
+
 
                 if new_blocks is None:  # block分配失败，说明空间不足，停止组batch
                     # The request cannot be scheduled.
                     break
+
 
                 # 当前请求的本地blocks分配成功后，更新block_table，拉取远端blocks
                 # KVTransfer: the connector uses this info to determine

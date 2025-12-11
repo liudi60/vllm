@@ -130,7 +130,14 @@ class BlockPool:
         enable_caching: Whether to enable prefix caching.
         enable_kv_cache_events: Whether to enable kv cache events.
     """
+    '''
+    BlockPool的初始化过程由KVCacheCoordinator发起[1a]，这是一个分层设计的内存管理系统。首先，系统会为整个GPU内存池创建固定数量
+    的KVCacheBlock对象[1b]，每个块都有唯一的block_id和引用计数器。接着，系统构建一个双向链表结构的FreeKVCacheBlockQueue[1c]，
+    用于高效管理空闲块的分配和回收，这个设计使得分配操作达到O(1)时间复杂度。最后，初始化BlockHashToBlockMap哈希表[1d]，为前缀缓存
+    功能提供快速查找能力，使得具有相同前缀的请求可以复用已计算的KV缓存块。
 
+    整个设计体现了预分配+引用计数+LRU淘汰的内存管理策略，是vLLM实现高并发推理的核心基础设施。
+    '''
     def __init__(
         self,
         num_gpu_blocks: int,
@@ -274,6 +281,97 @@ class BlockPool:
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
+        '''
+        它的核心作用是：实现 Prefix Caching（前缀缓存）的底层索引机制，将“token 序列的哈希值”映射到对应的已缓存 KV Cache block（或 block 链），从而支持高效复用。
+
+        ✅ 一、核心功能：Prefix Caching 的“查找表”
+        当启用 --enable-prefix-caching 时，vLLM 会缓存已完成 prefill 的请求的 KV Cache blocks，并允许后续具有相同前缀的请求直接复用这些 blocks，避免重复计算。
+        
+        为了快速判断“当前 prompt 前缀是否已被缓存”，vLLM 不可能逐 token 比较所有历史请求（太慢），而是：
+        
+        对 token 序列计算哈希值（如 rolling hash）
+        用哈希值作为 key，在 cached_block_hash_to_block 中查找
+        如果命中 → 直接获取对应的 blocks
+        🎯 所以，cached_block_hash_to_block 就是 prefix cache 的哈希索引表。
+        
+        ✅ 二、数据结构详解
+        虽然具体实现可能因版本而异，但逻辑上可理解为：
+        
+        # 伪代码
+        class BlockHashToBlockMap:
+            def __init__(self):
+                self._map: Dict[int, List[Block]] = {}  # hash_value -> [block1, block2, ...]
+        
+            def put(self, hash_val: int, blocks: List[Block]):
+                self._map[hash_val] = blocks
+        
+            def get(self, hash_val: int) -> Optional[List[Block]]:
+                return self._map.get(hash_val)
+        Key: int —— token 序列的哈希值（例如使用 xxHash 或 FNV-1a 计算）
+        Value: List[Block] —— 对应该前缀的物理 KV Cache blocks 列表
+        💡 注意：由于哈希冲突可能性极低（64-bit hash），vLLM 通常不做 collision 处理；若需严谨，可加 token 序列校验（但 vLLM 默认省略以提升性能）。
+        
+        ✅ 三、典型工作流程
+        场景：新请求到达，prompt = [10, 20, 30, 40, 50]
+        Step 1: 计算前缀哈希
+
+        hash_3 = hash([10, 20, 30])      # 可能命中
+        hash_4 = hash([10, 20, 30, 40])  # 更长匹配
+        hash_5 = hash([10, 20, 30, 40, 50])
+        vLLM 会从最长前缀开始尝试查找（贪心匹配）。
+        
+        Step 2: 查询 cached_block_hash_to_block
+
+        blocks = self.cached_block_hash_to_block.get(hash_5)
+        if blocks is None:
+            blocks = self.cached_block_hash_to_block.get(hash_4)
+            if blocks is None:
+                ...
+        Step 3: 命中后复用
+        获取 blocks 列表
+        将其作为 <new computed> 部分
+        跳过对应 tokens 的前向计算
+        ✅ 四、何时写入这个 map？
+        当一个请求完成整个 prefill 阶段（即所有 prompt tokens 已计算），vLLM 会：
+        
+        计算其完整 prompt 的哈希值
+        将 (hash, blocks) 插入 cached_block_hash_to_block
+
+        # 伪代码：prefill 完成后
+        prompt_hash = compute_hash(request.prompt_token_ids)
+        self.cached_block_hash_to_block.put(prompt_hash, request_blocks)
+        ⚠️ 注意：只有完整 prefill 完成的请求才会被缓存（Chunked Prefill 的中间 chunk 通常不缓存，除非特别支持 partial prefix caching）。
+        
+        ✅ 五、与引用计数（ref_cnt）的协同
+        当一个 block 被插入 cached_block_hash_to_block 时，其 ref_cnt 不会自动增加
+        只有当另一个请求真正复用它时，才通过 coordinator 或 get_computed_blocks 增加 ref_cnt
+        当原请求结束，ref_cnt -= 1，若为 0 → block 进入 free list，但仍保留在 cached_block_hash_to_block 中
+        直到 block 被真正回收（显存覆盖），才从 map 中移除（或 lazy 清理）
+        ✅ 这使得“缓存存在”和“物理可用”解耦，提升复用机会。
+        
+        ✅ 六、内存与性能权衡
+        优势	代价
+        O(1) 前缀查找	存储哈希表（内存开销小）
+        避免重复计算	哈希计算开销（可忽略）
+        支持高并发共享	需处理哈希冲突（vLLM 默认忽略）
+        实际测试表明，在 chat 场景中，该机制可减少 50%~80% 的 prefill 计算量。
+        
+        ✅ 七、总结
+        项目	说明
+        名称	cached_block_hash_to_block
+        类型	哈希映射（Dict[int, List[Block]]）
+        作用	Prefix Caching 的核心索引结构
+        Key	token 序列的哈希值
+        Value	对应的 KV Cache blocks 列表
+        写入时机	请求完成 prefill 后
+        读取时机	新请求调度时尝试复用前缀
+        设计目标	实现 O(1) 时间复杂度的缓存命中检查
+        🔑 一句话理解：
+        
+        它是 vLLM 的“前缀缓存电话簿”——你报一个 prompt 哈希，它告诉你“谁家的 KV Cache 可以借你用”。
+        
+        这个设计是 vLLM 在高并发场景下实现超高吞吐的关键优化之一。
+        '''
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = \
             BlockHashToBlockMap()
@@ -312,12 +410,19 @@ class BlockPool:
             cached_blocks.append(block)
         return cached_blocks
 
+
+
+    '''
+    blocks=self.req_to_blocks[request.request_id],  # 该请求已经分配的物理block_ids，包括prefix-cache命中的
+    num_cached_blocks=num_cached_blocks,            # 该请求当前已缓存数量（用于跳过）
+    num_full_blocks=num_full_blocks,                # 该请求当前应缓存到多少个
+    '''
     def cache_full_blocks(
         self,
         request: Request,
-        blocks: list[KVCacheBlock],
-        num_cached_blocks: int,
-        num_full_blocks: int,
+        blocks: list[KVCacheBlock],     # 该请求已经分配的物理block_ids，包括prefix-cache命中的
+        num_cached_blocks: int,         # 该请求当前已缓存数量（用于跳过）
+        num_full_blocks: int,           # 该请求当前应缓存到多少个
         block_size: int,
         kv_cache_group_id: int,
     ) -> None:
@@ -340,20 +445,29 @@ class BlockPool:
         """
         if num_cached_blocks == num_full_blocks:
             return
+        # blocks 是 self.req_to_blocks[request.request_id]，在调用 allocate_new_blocks函数时，大小已经扩充到 num_full_blocks
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
         assert len(request.block_hashes) >= num_full_blocks
-        new_block_hashes = request.block_hashes[num_cached_blocks:]
+        '''
+        request.block_hashes作用 
+        通常出现在 请求（Sequence 或 Request）的上下文管理类中（例如 SequenceGroup、SequenceData 或内部 block 管理结构），其作用是：
+        为当前请求的每一个已分配的物理 KV Cache block，缓存其对应的 token 子序列的哈希值（BlockHash），用于后续 Prefix Caching 的快速匹配与增量哈希计算。
+        
+        为什么每个block一个哈希值，而不是对整个请求计算一个哈希值？答：使用增量哈希。
+        '''
+        new_block_hashes = request.block_hashes[num_cached_blocks:]  # 此时新增tokens的block哈希已经在前面调用allocate_new_blocks函数中计算完成了
 
         new_hashes: Optional[list[ExternalBlockHash]] = (
             [] if self.enable_kv_cache_events else None)
-        for i, blk in enumerate(new_full_blocks):
+        for i, blk in enumerate(new_full_blocks):  # 遍历新分配的blocks
             assert blk.block_hash is None
             block_hash = new_block_hashes[i]
 
             # Update and added the full block to the cache.
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, kv_cache_group_id)
-            blk.block_hash = block_hash_with_group_id
+            blk.block_hash = block_hash_with_group_id  # 为了支持LoRA、Encoder-Decoder 场景
+            # todo 主要工作就是插入 cached_block_hash_to_block
             self.cached_block_hash_to_block.insert(block_hash_with_group_id,
                                                    blk)
             if new_hashes is not None:
@@ -401,7 +515,7 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
-                self._maybe_evict_cached_block(block)
+                self._maybe_evict_cached_block(block)  # 如果开启了prefix-cache，先做赎回操作
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
         else:
@@ -447,6 +561,7 @@ class BlockPool:
         return True
 
     def touch(self, blocks: tuple[list[KVCacheBlock], ...]) -> None:
+        # 遍历每一层的所有blocks，如果引用计数为0，则从free_block_queue中赎回
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
         another request with the same prefix.

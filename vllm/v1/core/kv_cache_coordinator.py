@@ -154,13 +154,14 @@ class KVCacheCoordinator(ABC):
             The number of blocks.
         """
         num_blocks_to_allocate = 0
-        for i, manager in enumerate(self.single_type_managers):
+        for i, manager in enumerate(self.single_type_managers):  # 分层遍历
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
                     request_id, num_encoder_tokens, [])
             else:
+                # 每一层需要新分配的blocks，累加
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
                     request_id, num_tokens, new_computed_blocks[i])
         return num_blocks_to_allocate
@@ -503,7 +504,65 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hit_blocks = hit_blocks_other_attn + hit_blocks_full_attn
         return hit_blocks, hit_length
 
+'''
+1
+vLLM KVCacheManager中coordinator协调架构设计
+本代码图展示了vLLM KVCacheManager中coordinator协调架构的设计原因和实现机制。通过分层设计，coordinator统一管理多种KV缓存类型
+（如完整注意力、滑动窗口、交叉注意力等）[1b]，为上层调度器提供统一接口[2a-2d]，同时支持混合注意力机制的前缀缓存优化[3a-3d]。这种
+设计使调度器无需感知底层差异[4a-4d]，而各种注意力管理器可以实现特定优化[5a-5d]。
 
+
+coordinator协调器的初始化架构
+KVCacheManager通过工厂模式创建coordinator，实现多种KV缓存类型的统一管理. Hide guide
+
+
+Motivation
+在大规模语言模型推理中，不同层可能使用不同的注意力机制（如完整注意力、滑动窗口、交叉注意力等），每种机制对KV缓存的管理需求差异很大。
+如果让上层调度器直接处理这些差异，会导致代码复杂且难以维护。coordinator协调器通过分层设计解决这一问题：它为多种KV缓存类型提供统一
+接口，让调度器无需感知底层差异，同时支持混合模型的前缀缓存优化。
+
+Details
+工厂模式选择协调器类型
+系统根据模型配置自动选择最合适的协调器实现[1b]：
+
+无缓存模式：KVCacheCoordinatorNoPrefixCache，适用于禁用前缀缓存的场景
+单组模式：UnitaryKVCacheCoordinator，适用于只使用一种注意力机制的模型
+混合模式：HybridKVCacheCoordinator，适用于包含多种注意力机制的复杂模型
+共享资源管理
+所有协调器都共享同一个BlockPool实例[1d]，确保内存资源的统一管理和高效利用。同时，协调器为每个KV缓存组创建对应的管理器[1c]，如
+FullAttentionManager、SlidingWindowManager等，每个管理器专门处理特定注意力机制的缓存逻辑。
+
+统一接口封装
+协调器为上层提供统一的操作接口，如free()、allocate_new_blocks()、cache_blocks()等。这些接口内部会遍历所有单类型管理器并执行
+相应操作，实现了接口统一、实现多样化的设计目标。
+
+这种架构设计使得vLLM能够灵活支持各种复杂的模型结构，同时保持代码的可维护性和扩展性。
+
+
+2
+协调器统一接口封装
+coordinator为不同类型的KV缓存管理器提供统一的操作接口. Hide guide
+
+AI generated guide
+Motivation
+在大规模语言模型推理中，vLLM需要处理多种不同的注意力机制，如完整注意力、滑动窗口注意力、交叉注意力等。每种机制对KV缓存的管理策略都不同：
+完整注意力需要缓存所有token，滑动窗口只需要缓存窗口内的token，交叉注意力则完全不支持前缀缓存。如果让上层调度器直接处理这些差异，会导致
+代码复杂且难以维护。coordinator协调器的核心目标就是统一管理多种KV缓存类型，为调度器提供一致的接口，隐藏底层实现的复杂性。
+
+Details
+coordinator采用分层协调模式设计。KVCacheManager作为最上层，通过工厂函数get_kv_cache_coordinator()根据配置创建合适的协调器
+实例[1b]。协调器内部维护一个single_type_managers数组，每个元素负责管理一种特定类型的KV缓存[1c]，所有管理器共享同一个block_pool
+资源池[1c]。
+
+这种设计的核心优势在于接口统一性。当调度器需要释放请求资源时，只需调用coordinator.free()[2a]，协调器会自动遍历所有管理器并执行各自
+的释放逻辑[2d]。分配新块时，协调器会根据管理器类型选择合适的参数：交叉注意力管理器使用num_encoder_tokens，其他管理器使用标准num_tokens[2b]。
+
+对于混合注意力模型，HybridKVCacheCoordinator实现了智能协调策略。它首先查找完整注意力的最长缓存命中[3a-3b]，然后在完整注意力范围
+内查找其他注意力的缓存[3c]，最后按层顺序合并结果[3d]，确保不同注意力类型之间的缓存一致性。
+
+整个架构让调度器代码保持简洁[4a-4d]，同时允许各种注意力管理器实现特定的优化策略，如滑动窗口的跳过计算[5a]、交叉注意力禁用缓存[5d]等，
+实现了高内聚低耦合的设计目标。
+'''
 def get_kv_cache_coordinator(kv_cache_config: KVCacheConfig,
                              max_model_len: int, use_eagle: bool,
                              enable_caching: bool,

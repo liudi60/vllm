@@ -15,6 +15,9 @@ export VLLM_USE_V1=1
 
 cd /home/ml/weight/
 
+
+# --enable-prefill-pre-allocate
+
 python -m vllm.entrypoints.openai.api_server \
        --model="Qwen3-8B-W8A8" \
        --served-model-name qwen3_moe \
@@ -32,7 +35,8 @@ python -m vllm.entrypoints.openai.api_server \
 		--min-prefill-batch-size 2 \
 		--prefill-request-batching-timeout-ms 10000 \
 		--scheduler-delay-us 1000000 \
-		--reserved-block-num 29
+		--reserved-block-num 29 \
+		--enable-prefill-pre-allocate
 
 
 cd -

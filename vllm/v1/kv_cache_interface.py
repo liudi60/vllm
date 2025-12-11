@@ -377,3 +377,5 @@ class KVCacheConfig:
     requests in decode phase, and only when idle block num(exclude reserved blocks) 
     in block pool is insufficient, and only for single one request."""
     reserved_block_num: int = 0
+    """whether pre-allocate total blocks for the request in prefill phase."""
+    enable_prefill_pre_allocate: bool = False

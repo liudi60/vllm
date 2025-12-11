@@ -6,6 +6,7 @@ from typing import Literal, Optional, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -215,6 +216,10 @@ class KVCacheManager:
                 # by a factor of dcp_size × pcp_size?
                 self.block_size *= dcp_world_size
 
+        '''
+        调用get_kv_cache_coordinator()工厂函数
+        
+        '''
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -223,10 +228,13 @@ class KVCacheManager:
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
         )
+        logger.warning(f'===== type(self.coordinator)={type(self.coordinator)}')
+        logger.warning(f'===== kv_cache_config.kv_cache_groups={kv_cache_config.kv_cache_groups}')
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
         self._reserved_blocks_in_use_request_id = None
+        self.prefill_pre_allocate_blocks_num_map = {}  # {request_id: num_pre_allocate_blocks所有层总块数}
 
     @property
     def usage(self) -> float:
@@ -249,6 +257,7 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    # 该函数就是获取prefix-cache命中的blocks，未开启prefix-cache时，则返回空
     def get_computed_blocks(self,
                             request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
@@ -311,14 +320,14 @@ class KVCacheManager:
             🧠 二、Logits 在 vLLM 推理流程中的作用
             
             关键步骤说明：
-            步骤	说明
-            1. 模型前向计算	对当前上下文（prompt + 已生成 tokens）执行一次 forward，输出 logits
-            2. Logits 处理	
-            应用 repetition penalty
-            temperature scaling
-            top-p/top-k filtering
-            3. 采样	根据处理后的 logits 选择下一个 token（如 argmax 或 multinomial sampling）
+            步骤	                    说明
+            1. 模型前向计算	        对当前上下文（prompt + 已生成 tokens）执行一次 forward，输出 logits
+            2. Logits 处理	        应用 repetition penalty
+                                    temperature scaling
+                                    top-p/top-k filtering
+            3. 采样	                根据处理后的 logits 选择下一个 token（如 argmax 或 multinomial sampling）
             4. （可选）Logprob 计算	若用户请求 logprobs，则用原始 logits 计算 log_softmax 得到 log probability
+            
             ✅ 三、Logits vs Logprobs vs Probabilities
             名称	含义	是否归一化	公式	用途
             Logits	原始分数	❌ 否	—	采样、后处理（penalty, temp）
@@ -415,12 +424,38 @@ class KVCacheManager:
 
         return KVCacheBlocks(computed_blocks), num_new_computed_tokens
 
-    def _reset_reserved_blocks_in_use_request_id(self, request_id:str):
-        if self._reserved_blocks_in_use_request_id == request_id:
-            logger.warning(f'===== KVCacheManager reset_reserved_blocks_in_use_request_id, request_id={request_id}')
-            self._reserved_blocks_in_use_request_id = None
 
     def _is_blocks_sufficient(self, request: Request, num_blocks_to_allocate: int) -> bool:
+        # todo prefill预分配 和 decode预留 这两个特性不能叠加，因为既然prefill预分配了，请求所占tokens就够用，没必要给decode预留了
+        #  prefill预分配 和 decode预留 道理一样。prefill预分配就是把block_pool中空闲block数判断递减，不真正预分配
+        #  先判断是否开启prefill预分配
+        # self.block_size=128
+        logger.warning(f'===== self.kv_cache_config.enable_prefill_pre_allocate={self.kv_cache_config.enable_prefill_pre_allocate},  self.block_size={self.block_size}, self.prefill_pre_allocate_blocks_num_map={self.prefill_pre_allocate_blocks_num_map}')
+        logger.warning(f'===== num_blocks_to_allocate={num_blocks_to_allocate}')
+        if self.kv_cache_config.enable_prefill_pre_allocate:
+            # 需要区分prefill和decode
+            if request.num_computed_tokens == 0:  # 1. prefill，需要预分配该请求全部tokens
+                # 当前分支可用空闲block数 = block_pool总空闲block数 - 所有prefill请求已预分配但未使用block数
+                num_free_blocks = self.block_pool.get_num_free_blocks() - sum(self.prefill_pre_allocate_blocks_num_map.values())
+                num_pre_allocate_blocks = cdiv(min(self.max_model_len, request.max_tokens), self.block_size) * self.num_kv_cache_groups  # 该prefill请求预分配block数，需要计算所有层
+                if num_pre_allocate_blocks > num_free_blocks:
+                    logger.warning(f'===== _is_blocks_sufficient, enable_prefill_pre_allocate, prefill, pre allocate insufficient')
+                    return False
+                else:  # 空闲block够用，记录该请求[可用预分配block数]
+                    self.prefill_pre_allocate_blocks_num_map[request.request_id] = num_pre_allocate_blocks - num_blocks_to_allocate
+
+            else:  # 2. decode及非prefill，本请求已经预分配的块数也算作空闲块
+                # 当前分支可用空闲block数 = block_pool中空闲block数 - 所有prefill请求已预分配但未使用block数 + 本请求预分配的block数
+                num_free_blocks = self.block_pool.get_num_free_blocks() - sum(self.prefill_pre_allocate_blocks_num_map.values()) + self.prefill_pre_allocate_blocks_num_map.get(request.request_id, 0)
+                if num_blocks_to_allocate > num_free_blocks:
+                    logger.warning(f'===== _is_blocks_sufficient, enable_prefill_pre_allocate, decode, pre allocate insufficient')
+                    return False
+                else:  # 空闲block够用，更新该请求[可用预分配block数]
+                    self.prefill_pre_allocate_blocks_num_map[request.request_id] -= num_blocks_to_allocate
+            return True
+
+
+
         # 此段只判断一个逻辑：空闲块是否够用
         # todo 111 此处判断reserve_block_num
         logger.warning(
@@ -502,17 +537,107 @@ class KVCacheManager:
         这些 token 的 KV 也需要存储
         如果不提前分配，验证过程中会 OOM 或触发昂贵的 block 重分配
     '''
+    '''
+    <computed> 和 <new computed>二者具体区别，并举例说明。
+    
+    在 vLLM 中，<computed> 和 <new computed> 都表示 已经完成前向计算、KV Cache 已存在 的 token 区域，但它们的归属和缓存来源不同。理解二者的区别对掌握 vLLM 的 Prefix Caching（前缀缓存）机制 至关重要。
+
+    ✅ 一、核心区别总结
+    特性	                <computed>	                            <new computed>
+    是否本请求自己计算过？	✅ 是	                                ❌ 否
+    KV Cache 来源	    本请求之前已分配并计算	                    其他请求缓存，当前通过 prefix caching 命中
+    首次出现时机	        Prefill 或 decode 阶段由本请求生成	        调度时发现已有缓存，直接复用
+    是否占用新 block？	已占用（历史分配）	                        不分配新 block，引用已有 block
+    典型场景	            请求自己的 prompt / 已生成 token	        多请求共享 system prompt、instruction 等
+
+    🔑 一句话概括：
+    <computed> = “我自己算过的”
+    <new computed> = “别人算过，我蹭的”
+
+    ✅ 二、举例说明
+    🌰 场景设定
+    模型：Llama-3-8B
+    启用 Prefix Caching：--enable-prefix-caching
+    Block size = 4（为方便演示）
+    词表中 "You are a helpful assistant. Q: " 对应 tokens [10, 20, 30, 40, 50, 60]（共 6 个 token）
+    📌 请求 A（先到达）
+
+    Prompt A: "You are a helpful assistant. Q: What is AI?"
+    调度过程：
+    首次调度，无任何缓存。
+    执行 prefill，计算全部 tokens。
+    分配 blocks 存储 KV Cache。
+    ✅ 此时：
+
+    <computed> = 6 tokens（"You are a helpful assistant. Q: "）
+    <new computed> = 0
+    <new> = 剩余 tokens（"What is AI?"）
+    所有 cache 都是 自己计算、自己分配 的。
+
+    📌 请求 B（后到达，共享前缀）
+
+    Prompt B: "You are a helpful assistant. Q: What is ML?"
+    调度过程：
+    调度器检查 prefix cache，发现前 6 个 tokens 与请求 A 完全相同。
+    命中 prefix cache → 这 6 个 tokens 的 KV Cache 已存在。
+    无需重新计算，也无需分配新 block，直接引用 A 的 blocks。
+    ✅ 此时（对请求 B 而言）：
+
+    <computed> = 0（B 自己还没计算过任何 token）
+    <new computed> = 6 tokens（复用 A 的 cache）
+    <new> = "What is ML?"（需要新计算）
+    尽管这 6 个 tokens 对系统而言是“已计算”的，但对 请求 B 本身 是“新复用”的，所以叫 <new computed>。
+
+    📊 内存视角对比
+    请求	Token 序列	Block 分配情况
+    A	[10,20,30,40,50,60,70,80]	分配 3 个 blocks（6+2 tokens）
+    B	[10,20,30,40,50,60,90,100]	只分配 2 个新 blocks（用于 90,100），前 6 个 tokens 共享 A 的 blocks
+    💡 vLLM 的 block 引用计数（ref-counting）机制确保：只要 A 或 B 任一存在，这些 blocks 就不会被释放。
+
+    ✅ 三、技术实现层面的区别
+    在 KVCacheManager.allocate_slots() 中：
+
+    # request.num_computed_tokens
+    # → 表示本请求已经自己计算过的 token 数（即 <computed>）
+
+    # num_new_computed_tokens
+    # → 表示本次调度通过 prefix cache 命中的 token 数（即 <new computed>）
+
+    num_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
+    request.num_computed_tokens：随本请求 decode 步骤递增（如每次生成 1 token，+1）
+    num_new_computed_tokens：在 prefill 阶段由 PrefixCachingBlockSpaceManager.get_computed_blocks() 返回
+
+    ✅ 五、常见误区澄清
+    误区	                                        正确理解
+    “<new computed> 是新计算的”	                ❌ 它是 新复用 的，未计算
+    “两者都占新显存”	                            ❌ <new computed> 不分配新 block，只增加引用
+    “只有 prefill 有 <new computed>”	            ✅ 基本正确（decode 阶段通常无共享）
+    “关闭 prefix caching 后 <new computed>=0”	✅ 正确
+
+    ✅ 总结
+    术语	            含义	                                        关键特征
+    <computed>	    本请求自己已计算 的 tokens	                    自产自销，block 为自己分配
+    <new computed>	通过 prefix cache 复用他人计算结果 的 tokens	蹭 cache，零计算、零新 block
+    🎯 优化目标：让 <new computed> 尽可能大（通过统一 prompt 模板 + 启用 prefix caching），从而减少 <new>，提升整体吞吐。
+
+    这种设计是 vLLM 在高并发场景下实现 高效缓存复用 的核心技术之一。
+    '''
     # 该函数在prefill和decode阶段都会被调用
     def allocate_slots(
         self,
         request: Request,
-        num_new_tokens: int,
-        num_new_computed_tokens: int = 0,
-        new_computed_blocks: Optional[KVCacheBlocks] = None,
+        num_new_tokens: int,  # 本轮推理新产生的token数
+        num_new_computed_tokens: int = 0,  # 本轮推理，本地缓存命中的token数（针对prefill）/ 本地已计算的token数（针对decode）
+        new_computed_blocks: Optional[KVCacheBlocks] = None,  # 与 num_new_computed_tokens 一致，上面tokens对应的blocks。
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
     ) -> Optional[KVCacheBlocks]:
+        logger.warning(f'===== allocate_slots,')
+        logger.warning(f'===== num_new_tokens={num_new_tokens}')
+        logger.warning(f'===== num_new_computed_tokens={num_new_computed_tokens}')
+        logger.warning(f'===== new_computed_blocks={new_computed_blocks}')
+
         """Add slots for a request with new tokens to append.
 
         Args:
@@ -548,6 +673,8 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
+
+
         if num_new_tokens == 0:
             raise ValueError("num_new_tokens must be greater than 0")
 
@@ -589,9 +716,10 @@ class KVCacheManager:
         tuple([] for _ in range(...))	为每个 KV Cache group 初始化空 block 列表
         这是 vLLM 高效管理多粒度 KV Cache 的关键设计之一，支持灵活的缓存复用和分组策略。
         '''
-        if new_computed_blocks is not None:
+        if new_computed_blocks is not None:  # prefill请求，并且prefix-cache命中
             new_computed_block_list = new_computed_blocks.blocks
         else:
+            # tuple大小表示层数，模型固定的
             new_computed_block_list = tuple(
                 [] for _ in range(len(self.kv_cache_config.kv_cache_groups)))
 
@@ -621,22 +749,29 @@ class KVCacheManager:
         '''
         计算总共需要多少 tokens 的 slot
         
-        request.num_computed_tokens：该请求已实际执行前向传播的 token 数。
-        num_new_computed_tokens：本次调度中通过 prefix caching 复用的 token 数（即命中缓存，无需重新计算，但仍需占用 KV Cache）。
+        request.num_computed_tokens：该请求已自身已执行前向传播完成的 token 数。划分情况如下：
+            prefill：0
+            chunk-prefill：前面chunk已计算的部分prompt（包括之前 chunk）
+            decode：prompt + 已经decode部分
+        num_new_computed_tokens：本次调度中通过 prefix caching 复用的 token 数（即命中缓存，无需重新计算，但仍需占用 KV Cache）。划分情况如下：
+            prefill：prefix-cache命中的缓存token数 
+            chunk-prefill：本次chunk-prefill命中的缓存token数
+            decode：0  
+            
         两者相加得到 当前总共“已缓存”或“将缓存”的 token 数（即已有 + 复用 = 已覆盖的范围）。
         ⚠️ 注意：num_new_computed_tokens 通常来自 prompt sharing 或 chunked prefill 的 cache hit。
         
         '''
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
-        num_computed_tokens = (request.num_computed_tokens +
-                               num_new_computed_tokens)
+        num_computed_tokens = (request.num_computed_tokens +  # 该请求已经自己计算的tokens
+                               num_new_computed_tokens)  # 该请求当前调度轮次命中的缓存tokens
         '''
         计算总共需要分配 KV Cache slot 的 token 数量：
 
         项	                    说明
-        num_computed_tokens	    已缓存/复用的 token（仍需保留 blocks）
-        num_new_tokens	        本次要处理的新 token（如 prompt 剩余部分或生成的 token）
+        num_computed_tokens	    本请求自己计算的tokens + 本请求本次调度命中的缓存tokens 
+        num_new_tokens	        本次调度需要生成的新tokens 
         num_lookahead_tokens	speculative decoding 中的“草稿 token”数量
         self.max_model_len	    模型最大上下文长度（硬限制）
         ✅ 举例：
@@ -648,11 +783,11 @@ class KVCacheManager:
         → num_tokens_need_slot = min(100+10+5, 2048) = 115
         '''
         num_tokens_need_slot = min(
-            num_computed_tokens + num_new_tokens + num_lookahead_tokens,
+            num_computed_tokens + num_new_tokens + num_lookahead_tokens,  # 到本次调度（包括本次调度）为止，该请求所占用的tokens数（缓存命中的也算数）
             self.max_model_len)
 
         '''
-        计算需要分配多少 blocks
+        根据token数计算本次调度需要新分配多少 block数，所有层 
         调用协调器（coordinator，通常是 BlockSpaceManager 的封装）计算：为了容纳 num_tokens_need_slot 个 tokens，还需分配多少新的物理 blocks。
         它会考虑：
         该请求已占用的 blocks
@@ -660,16 +795,18 @@ class KVCacheManager:
         encoder tokens（用于 encoder-decoder 架构，如 T5）
         返回值是 净新增 block 数量（不是总 block 数）。
         '''
+        # todo 此处重点。根据token数（）计算block数
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
-            new_computed_blocks=new_computed_block_list,
+            new_computed_blocks=new_computed_block_list,  # 缓存命中blocks（prefill）或 None（decode）
             num_encoder_tokens=num_encoder_tokens,
         )
 
         if not self._is_blocks_sufficient(request, num_blocks_to_allocate):
             return None
 
+        # 将prefix-cache命中的blocks中，引用计数为0的blocks赎回
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
             self.block_pool.touch(new_computed_block_list)
@@ -677,29 +814,101 @@ class KVCacheManager:
             assert not any(new_computed_block_list), (
                 "Computed blocks should be empty when "
                 "prefix caching is disabled")
-
+        # 将 new_computed_block_list（prefix-cache命中的blocks） 追加到 req_to_blocks[request_id]
         # Append the new computed blocks to the request blocks until now to
         # avoid the case where the new blocks cannot be allocated.
         self.coordinator.save_new_computed_blocks(request.request_id,
                                                   new_computed_block_list)
 
+        # 按每层分配blocks，然后追加到 single_type_kv_cache_manager.req_to_blocks[request_id]
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id, num_tokens_need_slot, num_encoder_tokens)
 
+        
+        
+        # # todo （不使用这种方式实现，不真正预分配）这里判断是否prefill请求，并且开启了预分配开关，是则为prefill请求预分配全部blocks
+        # #  注：enable_prefill_pre_allocate（block预分配） 和 reserve_blocks（预留block）不能同时开启
+        # logger.warning(f'===== self.kv_cache_config.enable_prefill_pre_allocate={self.kv_cache_config.enable_prefill_pre_allocate}')
+        # if (request.num_computed_tokens == 0 and self.kv_cache_config.enable_prefill_pre_allocate
+        #         and not self.prefill_pre_allocate_blocks_num_map[request.request_id]):
+        #     # 剩余要分配的block数 = 该请求总block数（所有层） - 已分配block数    （考虑所有层）
+        #     already_allocated_blocks = self.coordinator.get_blocks(request.request_id)                          # 该请求所有层已分配block列表 tuple(list_layer0, list_layer1, list_layer2, ...)
+        #     num_layers = len(already_allocated_blocks)                                                          # 层数
+        #     num_already_allocated_blocks = sum([len(b) for b in already_allocated_blocks])                      # 该请求所有层已分配block数
+        #     num_total_blocks = cdiv(min(self.max_model_len, request.max_tokens), self.block_size) * num_layers  # 该请求总block数（所有层）
+        #     num_to_be_allocated_blocks = num_total_blocks - num_already_allocated_blocks                        # 剩余需要分配的block数
+        #     if num_to_be_allocated_blocks <= self.coordinator.block_pool.get_num_free_blocks():
+        #         block_list: list[KVCacheBlock] = self.coordinator.block_pool.get_new_blocks(num_to_be_allocated_blocks)
+        #         request.prefill_pre_allocate_blocks = block_list
+        #         self.prefill_pre_allocate_blocks_num_map[request.request_id] = block_list  # 预分配的blocks记录在kv_cache_manager实例中
+
+
+        '''
+        条件 1：not self.enable_caching
+        用户未启用 Prefix Caching（启动参数未加 --enable-prefix-caching）
+        → 自然不需要做任何缓存操作
+        条件 2：delay_cache_blocks
+        这是一个 布尔标志，通常由调度器根据请求来源设置
+        在以下场景为 True：
+        当前是 Decode 节点，blocks 是从 Prefill 节点 接收而来
+        或处于 ** speculative decoding 的 draft 阶段**（尚未验证，不能缓存）
+        或系统处于 内存压力下，暂时禁用缓存
+        ✅ 只要满足任一条件，就 跳过后续的 cache_blocks(...) 调用
+        '''
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
             return KVCacheBlocks(new_blocks)
 
+        '''
+        # 以下就是要缓存blocks了
+        
+        计算要缓存的 token 数量（关键！）
+        🔍 关键变量解释：
+        变量	                    含义
+        num_computed_tokens	    该请求之前已计算的 token 数（包括复用的 prefix）
+        num_new_tokens	        本次调度新计算的 token 数
+        request.num_tokens	    该请求当前已确认（finalized）的总 token 数
+        
+        🧠 为什么需要 min(...)？
+        在 Speculative Decoding（推测解码） 场景中：
+        请求可能生成了 draft tokens（比如 5 个）
+        但只有部分被 验证通过（accepted）
+        request.num_tokens 只包含 已接受的 tokens
+        如果直接缓存 num_computed_tokens + num_new_tokens，可能会把 未被接受的 draft tokens 的 KV Cache 也缓存了 → 导致后续错误复用！
+        ✅ 所以：只缓存到 request.num_tokens 为止，确保缓存的是“确定不会变”的 tokens。
+        '''
         # NOTE(woosuk): We want to commit (cache) up to num_computed_tokens +
         # num_new_tokens, but must exclude "non-committable" tokens (e.g.,
         # draft tokens that could be rejected). Therefore, we cap the number
         # at `request.num_tokens`, ensuring only "finalized" tokens are cached.
         num_tokens_to_cache = min(num_computed_tokens + num_new_tokens,
                                   request.num_tokens)
+        '''
+        todo 重要！！！
+        提交（缓存）blocks
+        主要是使用（现有blocks + 新分配的blocks）更新 self.num_cached_block  
+        
+        注意：此处所说的缓存，不是prefix-cache，而是更新 self.num_cached_block 
+        作用：将该请求当前的 KV Cache blocks 注册到 prefix cache 中（即写入 cached_block_hash_to_block）
+        触发条件：只有当整个 prompt 或已生成序列 完成 prefill/decode 到某个稳定点 时才缓存
+        缓存内容：对应前 num_tokens_to_cache 个 tokens 的 blocks
+        ⚠️ 注意：不是每次调度都缓存，而是当达到“可提交”状态时（如 prefill 完成、或 speculative step accepted）。
+        '''
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return KVCacheBlocks(new_blocks)
+
+    def _reset_reserved_blocks_in_use_request_id(self, request_id:str):
+        if self._reserved_blocks_in_use_request_id == request_id:
+            logger.warning(f'===== KVCacheManager reset_reserved_blocks_in_use_request_id, request_id={request_id}')
+            self._reserved_blocks_in_use_request_id = None
+
+    def _remove_prefill_pre_allocate_blocks(self, request: Request):
+        """remove pre-allocate blocks num for the request when the request is over."""
+        logger.warning(f'===== _remove_prefill_pre_allocate_blocks, self.prefill_pre_allocate_blocks_num_map={self.prefill_pre_allocate_blocks_num_map}')
+        self.prefill_pre_allocate_blocks_num_map.pop(request.request_id, None)
+        logger.warning(f'===== self.prefill_pre_allocate_blocks_num_map={self.prefill_pre_allocate_blocks_num_map}')
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -710,7 +919,9 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self._reset_reserved_blocks_in_use_request_id(request.request_id)
+        self._remove_prefill_pre_allocate_blocks(request)
         self.coordinator.free(request.request_id)
+
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

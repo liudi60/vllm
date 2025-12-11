@@ -357,6 +357,7 @@ class EngineArgs:
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: Optional[int] = CacheConfig.kv_cache_memory_bytes
     reserved_block_num: Optional[int] = CacheConfig.reserved_block_num
+    enable_prefill_pre_allocate: Optional[bool] = CacheConfig.enable_prefill_pre_allocate
     max_num_batched_tokens: Optional[
         int] = SchedulerConfig.max_num_batched_tokens
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
@@ -368,6 +369,7 @@ class EngineArgs:
     min_prefill_batch_size: Optional[int] = SchedulerConfig.min_prefill_batch_size
     prefill_request_batching_timeout_ms: Optional[int] = SchedulerConfig.prefill_request_batching_timeout_ms
     scheduler_delay_us: Optional[int] = SchedulerConfig.scheduler_delay_us
+
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
     disable_log_stats: bool = False
@@ -836,6 +838,8 @@ class EngineArgs:
                                  **cache_kwargs["mamba_ssm_cache_dtype"])
         cache_group.add_argument("--reserved-block-num",
                                  **cache_kwargs["reserved_block_num"])
+        cache_group.add_argument("--enable-prefill-pre-allocate",
+                                     **cache_kwargs["enable_prefill_pre_allocate"])
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)
@@ -1381,6 +1385,7 @@ class EngineArgs:
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             reserved_block_num=self.reserved_block_num,
+            enable_prefill_pre_allocate=self.enable_prefill_pre_allocate,
         )
 
         logger.warning(f'===== cache_config={cache_config}')

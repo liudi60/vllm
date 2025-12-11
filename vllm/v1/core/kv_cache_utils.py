@@ -37,6 +37,25 @@ BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
 ExternalBlockHash = Union[bytes, int]
 
 
+'''
+# 拼接两个字节串
+✅ 一、设计目的：支持缓存隔离（Cache Isolation）
+在以下场景中，不同请求的相同 token 序列不应共享 KV Cache：
+
+场景	            原因
+多模型服务	    模型 A 和模型 B 的 "Hello" 生成的 KV 不同
+多 LoRA 适配器	同一 base model + 不同 LoRA → KV 不同
+多用户/租户隔离	安全或正确性要求不能跨用户复用
+Encoder-Decoder 模型	encoder 和 decoder 的 KV 空间需分开
+
+→ 需要将 缓存 key 与“上下文组”绑定。
+
+但若直接用 (block_hash, group_id) 元组作 key：
+
+内存开销大（Python tuple 有额外 overhead）
+哈希性能差
+于是 vLLM 采用 字节拼接 方式构造复合 key。
+'''
 def make_block_hash_with_group_id(block_hash: BlockHash,
                                   group_id: int) -> BlockHashWithGroupId:
     """Pack a ``BlockHash`` and group id into a ``BlockHashWithGroupId``.

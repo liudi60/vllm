@@ -131,6 +131,7 @@ class Request:
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0
 
+        # self.block_hashes：为当前请求的每一个已分配的物理 KV Cache block，缓存其对应的 token 子序列的哈希值（BlockHash），用于后续 Prefix Caching 的快速匹配与增量哈希计算。
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Optional[Callable[
             [], list[BlockHash]]] = None
