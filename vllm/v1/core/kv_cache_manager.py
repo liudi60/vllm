@@ -6,6 +6,7 @@ from typing import Literal, Optional, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -130,6 +131,7 @@ class KVCacheManager:
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
         self._reserved_blocks_in_use_request_id = None
+        self.prefill_pre_allocate_blocks_num_map = {}  # {request_id: num_pre_allocate_blocks所有层总块数}
 
     @property
     def usage(self) -> float:
@@ -191,12 +193,44 @@ class KVCacheManager:
 
         return KVCacheBlocks(computed_blocks), num_new_computed_tokens
 
-    def _reset_reserved_blocks_in_use_request_id(self, request_id:str):
-        if self._reserved_blocks_in_use_request_id == request_id:
-            logger.warning(f'===== KVCacheManager reset_reserved_blocks_in_use_request_id, request_id={request_id}')
-            self._reserved_blocks_in_use_request_id = None
-
     def _is_blocks_sufficient(self, request: Request, num_blocks_to_allocate: int) -> bool:
+        # todo prefill预分配 和 decode预留 这两个特性不能叠加，因为既然prefill预分配了，请求所占tokens就够用，没必要给decode预留了
+        #  prefill预分配 和 decode预留 道理一样。prefill预分配就是把block_pool中空闲block数判断递减，不真正预分配
+        #  先判断是否开启prefill预分配
+        # self.block_size=128
+        logger.warning(
+            f'===== self.kv_cache_config.enable_prefill_pre_allocate={self.kv_cache_config.enable_prefill_pre_allocate},  self.block_size={self.block_size}, self.prefill_pre_allocate_blocks_num_map={self.prefill_pre_allocate_blocks_num_map}')
+        logger.warning(f'===== num_blocks_to_allocate={num_blocks_to_allocate}')
+        if self.kv_cache_config.enable_prefill_pre_allocate:
+            # 需要区分prefill和decode
+            if request.num_computed_tokens == 0:  # 1. prefill，需要预分配该请求全部tokens
+                # 当前分支可用空闲block数 = block_pool总空闲block数 - 所有prefill请求已预分配但未使用block数
+                num_free_blocks = self.block_pool.get_num_free_blocks() - sum(
+                    self.prefill_pre_allocate_blocks_num_map.values())
+                num_pre_allocate_blocks = cdiv(min(self.max_model_len, request.max_tokens),
+                                               self.block_size) * self.num_kv_cache_groups  # 该prefill请求预分配block数，需要计算所有层
+                if num_pre_allocate_blocks > num_free_blocks:
+                    logger.warning(
+                        f'===== _is_blocks_sufficient, enable_prefill_pre_allocate, prefill, pre allocate insufficient')
+                    return False
+                else:  # 空闲block够用，记录该请求[可用预分配block数]
+                    self.prefill_pre_allocate_blocks_num_map[
+                        request.request_id] = num_pre_allocate_blocks - num_blocks_to_allocate
+
+            else:  # 2. decode及非prefill，本请求已经预分配的块数也算作空闲块
+                # 当前分支可用空闲block数 = block_pool中空闲block数 - 所有prefill请求已预分配但未使用block数 + 本请求预分配的block数
+                num_free_blocks = self.block_pool.get_num_free_blocks() - sum(
+                    self.prefill_pre_allocate_blocks_num_map.values()) + self.prefill_pre_allocate_blocks_num_map.get(
+                    request.request_id, 0)
+                if num_blocks_to_allocate > num_free_blocks:
+                    logger.warning(
+                        f'===== _is_blocks_sufficient, enable_prefill_pre_allocate, decode, pre allocate insufficient')
+                    return False
+                else:  # 空闲block够用，更新该请求[可用预分配block数]
+                    self.prefill_pre_allocate_blocks_num_map[request.request_id] -= num_blocks_to_allocate
+            return True
+
+
         # 此段只判断一个逻辑：空闲块是否够用
         # todo 111 此处判断reserve_block_num
         logger.warning(
@@ -347,6 +381,18 @@ class KVCacheManager:
 
         return KVCacheBlocks(new_blocks)
 
+    def _reset_reserved_blocks_in_use_request_id(self, request_id: str):
+        if self._reserved_blocks_in_use_request_id == request_id:
+            logger.warning(f'===== KVCacheManager reset_reserved_blocks_in_use_request_id, request_id={request_id}')
+            self._reserved_blocks_in_use_request_id = None
+
+    def _remove_prefill_pre_allocate_blocks(self, request: Request):
+        """remove pre-allocate blocks num for the request when the request is over."""
+        logger.warning(
+            f'===== _remove_prefill_pre_allocate_blocks, self.prefill_pre_allocate_blocks_num_map={self.prefill_pre_allocate_blocks_num_map}')
+        self.prefill_pre_allocate_blocks_num_map.pop(request.request_id, None)
+        logger.warning(f'===== self.prefill_pre_allocate_blocks_num_map={self.prefill_pre_allocate_blocks_num_map}')
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -356,6 +402,7 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self._reset_reserved_blocks_in_use_request_id(request.request_id)
+        self._remove_prefill_pre_allocate_blocks(request)
         self.coordinator.free(request.request_id)
 
     def reset_prefix_cache(self) -> bool:

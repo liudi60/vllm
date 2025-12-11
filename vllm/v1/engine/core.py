@@ -212,6 +212,7 @@ class EngineCore:
         logger.warning(f'===== _initialize_kv_caches, scheduler_kv_cache_config={scheduler_kv_cache_config}')
         logger.warning(f'===== vllm_config.cache_config={vllm_config.cache_config}')
         scheduler_kv_cache_config.reserved_block_num = vllm_config.cache_config.reserved_block_num
+        scheduler_kv_cache_config.enable_prefill_pre_allocate = vllm_config.cache_config.enable_prefill_pre_allocate
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:

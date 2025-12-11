@@ -131,6 +131,9 @@ class CacheConfig:
     """Reserved block num in the block pool. these blocks are only available 
     for allocating operation from decode-phase request."""
 
+    enable_prefill_pre_allocate: bool = False
+    """whether pre-allocate total blocks for the request in prefill phase."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
