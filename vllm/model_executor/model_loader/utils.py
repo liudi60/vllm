@@ -173,6 +173,8 @@ def _get_model_architecture(
         model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     architectures = getattr(model_config.hf_config, "architectures", [])
 
+    logger.warning(f'===== architectures={architectures}')
+
     model_cls, arch = model_config.registry.resolve_model_cls(
         architectures,
         model_config=model_config,
@@ -209,6 +211,9 @@ def _get_model_architecture(
         model_cls = as_reward_model(model_cls)
     else:
         assert_never(convert_type)
+
+    # ===== convert_type=none, model_cls=<class 'vllm.model_executor.models.qwen3.Qwen3ForCausalLM'>, arch=Qwen3ForCausalLM
+    logger.warning(f'===== convert_type={convert_type}, model_cls={model_cls}, arch={arch}')
 
     return model_cls, arch
 

@@ -31,6 +31,39 @@ from vllm.config.device import Device, DeviceConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.config.load import LoadConfig
+'''
+作用是 引入用于配置 LoRA（Low-Rank Adaptation）微调参数的配置类。
+
+🔍 背景：什么是 LoRA？
+LoRA（Low-Rank Adaptation） 是一种高效的参数微调方法，由 Microsoft 提出。它通过在原始大模型权重旁路添加低秩矩阵（low-rank matrices）来实现微调，从而：
+
+冻结原始大模型参数（不更新）
+只训练少量新增参数
+显著降低显存占用和计算开销
+LoRA 广泛用于 LLM 的高效微调（如 Qwen、Llama、ChatGLM 等）。
+
+🧩 LoRAConfig 在 vLLM 中的作用
+LoRAConfig 是 vLLM 内部用于 描述和管理 LoRA 适配器配置 的数据类（通常是一个 dataclass 或 Pydantic 模型），它定义了加载或应用 LoRA 权重时所需的参数。
+
+📁 文件位置说明
+vllm/config/lora.py 是 vLLM 源码中专门存放 LoRA 相关配置的模块。
+LoRAConfig 会被 EngineArgs、LLM 类等使用，最终传递给底层的 PagedAttention + LoRA kernel（由 vLLM 的 C++/CUDA 层实现高效融合）。
+⚠️ 注意事项
+仅用于推理：vLLM 的 LoRAConfig 是为 推理时加载预训练好的 LoRA 权重 设计的，不支持在 vLLM 中训练 LoRA。
+LoRA 权重需提前训练好：通常用 Hugging Face PEFT 训练，保存为 adapter_model.bin + adapter_config.json。
+模块名需匹配：lora_modules 必须与基础模型的层命名一致（如 Llama 的 q_proj, k_proj, v_proj, o_proj）。
+🔗 相关概念
+组件	作用
+LoRAConfig	定义 LoRA 的结构和资源限制
+LoRARequest	单次推理请求中指定使用哪个 LoRA 适配器
+enable_lora=True	启用 vLLM 的 LoRA 支持（需编译时开启）
+
+这行代码的目的是：
+
+导入 vLLM 中用于配置 LoRA 微调适配器参数的类，以便在推理时高效加载和切换多个 LoRA 模型，而无需修改原始大模型权重。
+
+它是 vLLM 实现 “一个基础模型 + 多个 LoRA 适配器” 低成本服务架构的关键组成部分。
+'''
 from vllm.config.lora import LoRAConfig
 from vllm.config.model import (ConvertOption, HfOverrides, LogprobsMode,
                                ModelConfig, ModelDType, ModelImpl,
@@ -457,6 +490,8 @@ class VllmConfig:
                            "but the scheduler is configured to publish them."
                            "Modify KVEventsConfig.enable_kv_cache_events"
                            "to True to enable.")
+        # current_platform.get_device_name(0)=Ascend910B3
+        logger.warning(f'===== current_platform.check_and_update_config(self), current_platform.get_device_name(0)={current_platform.get_device_name(0)}')
         current_platform.check_and_update_config(self)
 
         # final check of cudagraph mode after platform-specific update

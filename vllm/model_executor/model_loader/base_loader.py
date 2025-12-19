@@ -42,11 +42,13 @@ class BaseModelLoader(ABC):
         target_device = torch.device(load_device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
+                logger.warning(f'===== model = initialize_model')
                 model = initialize_model(vllm_config=vllm_config,
                                          model_config=model_config)
 
             logger.debug("Loading weights on %s ...", load_device)
+            logger.warning(f'===== self.load_weights')
             # Quantization does not happen in `load_weights` but after it
-            self.load_weights(model, model_config)
+            self.load_weights(model, model_config)  # loader=<vllm.model_executor.model_loader.default_loader.DefaultModelLoader object at 0xfffeccce6010>
             process_weights_after_loading(model, model_config, target_device)
         return model.eval()

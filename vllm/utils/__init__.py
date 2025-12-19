@@ -2676,9 +2676,19 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     """
     Resolve an object by its fully-qualified class name.
     """
+    '''
+    qualname："vllm_ascend.platform.NPUPlatform" 
+    module_name：vllm_ascend.platform，即指的是 /home/liudi/vllm-workspace/vllm-ascend/vllm_ascend/platform.py 文件 
+    obj_name：NPUPlatform，即在plateform.py中定义的 class NPUPlatform(Platform) 类  
+    
+    importlib.import_module("vllm_ascend.platform") 是动态导入模块，解析如下：
+        1、vllm_ascend是在vllm_ascend仓目录下执行pip install . 安装到python的模块，该模块的名称是在vllm_ascend仓中的setup.py中setup函数的name定义的；
+        2、vllm_ascend.platform表示代码仓中vllm_ascend/platform.py；
+    getattr(module, obj_name) 即 getattr("vllm_ascend.platform", "NPUPlatform")，表示vllm_ascend/platform.py中的 class NPUPlatform 。
+    '''
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
-    return getattr(module, obj_name)
+    return getattr(module, obj_name)  # 此处返回的就是 class NPUPlatform(Platform) 类
 
 
 def kill_process_tree(pid: int):

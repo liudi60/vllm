@@ -209,10 +209,16 @@ class WorkerWrapperBase:
         load_general_plugins()
 
         if isinstance(self.vllm_config.parallel_config.worker_cls, str):
-            worker_class = resolve_obj_by_qualname(
-                self.vllm_config.parallel_config.worker_cls)
+            # todo self.vllm_config.parallel_config.worker_cls 赋值在哪里？
+            '''
+            vllm/config/__init__.py
+                __post_init__()函数
+                    current_platform.check_and_update_config(self) # 此处current_platform是vllm-ascend中 class NPUPlatform
+                        parallel_config.worker_cls = "vllm_ascend.worker.worker_v1.NPUWorker"  # 这个配置就是在vllm-ascend中修改的 
+            '''
+            worker_class = resolve_obj_by_qualname(self.vllm_config.parallel_config.worker_cls)
             # ===== init_worker 1, worker_class=<class 'vllm_ascend.worker.worker_v1.NPUWorker'>
-            logger.warning(f'===== init_worker 1, worker_class={worker_class}')
+            logger.warning(f'===== init_worker 1, self.vllm_config.parallel_config.worker_cls={self.vllm_config.parallel_config.worker_cls}, worker_class={worker_class}')
         else:
             logger.warning(
                 "passing worker_cls as a class object is strongly deprecated,"
@@ -226,7 +232,7 @@ class WorkerWrapperBase:
                 self.vllm_config.parallel_config.worker_cls)
             logger.warning(f'===== init_worker 2, worker_class={worker_class}')
 
-        if self.vllm_config.parallel_config.worker_extension_cls:
+        if self.vllm_config.parallel_config.worker_extension_cls:  # 空
             worker_extension_cls = resolve_obj_by_qualname(
                 self.vllm_config.parallel_config.worker_extension_cls)
             logger.warning(f'===== init_worker, worker_extension_cls={worker_extension_cls}')
@@ -249,6 +255,7 @@ class WorkerWrapperBase:
                     "Injected %s into %s for extended collective_rpc calls %s",
                     worker_extension_cls, worker_class, extended_calls)
         with set_current_vllm_config(self.vllm_config):
+            logger.warning(f'===== self.worker = worker_class(**kwargs)')
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs)
             assert self.worker is not None

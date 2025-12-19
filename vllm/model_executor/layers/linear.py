@@ -1032,6 +1032,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         if is_gguf_weight_type:
             idx_map = {"q": 0, "k": 1, "v": 2}
             if loaded_shard_id is not None:
+                # Parameter.copy_() 是一个 原地（in-place）复制操作，用于将另一个张量（tensor）的数据 直接复制到当前 Parameter 对象的内存中
                 param.data[idx_map[loaded_shard_id]].copy_(loaded_weight)
                 param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
             else:

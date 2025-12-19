@@ -581,9 +581,45 @@ def safetensors_weights_iterator(
                 state_dict = load(f.read())
             yield from state_dict.items()
         else:
+            # st_file = 'Qwen3-8B-W8A8/quant_model_weight_w8a8.safetensors'
             with safe_open(st_file, framework="pt") as f:
+                '''
+                    这些keys就是config.json中定义的。
+                    lm_head.weight
+                    model.embed_tokens.weight
+                    model.layers.0.input_layernorm.weight
+                    model.layers.0.mlp.down_proj.weight
+                    model.layers.0.mlp.gate_proj.deq_scale
+                    model.layers.0.mlp.gate_proj.input_offset
+                    model.layers.0.mlp.gate_proj.input_scale
+                    model.layers.0.mlp.gate_proj.quant_bias
+                    model.layers.0.mlp.gate_proj.weight
+                    model.layers.0.mlp.gate_proj.weight_offset
+                    model.layers.0.mlp.gate_proj.weight_scale
+                    model.layers.0.mlp.up_proj.deq_scale
+                    model.layers.0.mlp.up_proj.input_offset
+                    model.layers.0.mlp.up_proj.input_scale
+                    model.layers.0.mlp.up_proj.quant_bias
+                    model.layers.0.mlp.up_proj.weight
+                    model.layers.0.mlp.up_proj.weight_offset
+                    model.layers.0.mlp.up_proj.weight_scale
+                    model.layers.0.post_attention_layernorm.weight
+                    model.layers.0.self_attn.k_norm.weight
+                    model.layers.0.self_attn.k_proj.deq_scale
+                    model.layers.0.self_attn.k_proj.input_offset
+                    model.layers.0.self_attn.k_proj.input_scale
+                    model.layers.0.self_attn.k_proj.quant_bias
+                    model.layers.0.self_attn.k_proj.weight
+                    model.layers.0.self_attn.k_proj.weight_offset
+                    model.layers.0.self_attn.k_proj.weight_scale
+                    model.layers.0.self_attn.o_proj.deq_scale
+                    model.layers.0.self_attn.o_proj.input_offset
+                    model.layers.0.self_attn.o_proj.input_scale
+                    model.layers.0.self_attn.o_proj.quant_bias
+                    ... 
+                    '''
                 for name in f.keys():  # noqa: SIM118
-                    param = f.get_tensor(name)
+                    param = f.get_tensor(name)  # get_tensor就是通过 key(name) 获取 权重数据weight(param)
                     yield name, param
 
 
@@ -800,6 +836,13 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
 def default_weight_loader(param: torch.Tensor,
                           loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
+    '''
+    在 PyTorch 中，Parameter.data.fill_() 和 Parameter.copy_() 都是 原地（in-place）操作，
+    用于修改 Parameter 的底层数据，但它们的 功能、用途和行为有本质区别。
+    
+     1. fill_(value)：用同一个标量值填充整个张量。
+     2. copy_(other)：用另一个张量的值逐元素复制。
+    '''
     try:
         if param.numel() == 1 and loaded_weight.numel() == 1:
             # Sometimes scalar values aren't considered tensors with shapes

@@ -17,11 +17,17 @@ cd /home/ml/weight/
 
 
 # --enable-prefill-pre-allocate
+#		--scheduling-policy "sjf" \
+#		--min-prefill-batch-size 2 \
+#		--prefill-request-batching-timeout-ms 10000 \
+#		--scheduler-delay-us 1000000 \
+#		--reserved-block-num 29 \
+#		--enable-prefill-pre-allocate
 
 python -m vllm.entrypoints.openai.api_server \
        --model="Qwen3-8B-W8A8" \
        --served-model-name qwen3_moe \
-       --gpu-memory-utilization 0.9 \
+       --gpu-memory-utilization 0.5 \
        --max-num-seqs 768 \
        --max-model-len 22528 \
        --trust-remote-code \
@@ -30,13 +36,8 @@ python -m vllm.entrypoints.openai.api_server \
        --tensor-parallel-size 2 \
        --port 8000 \
 		--enforce-eager \
-		--compilation-config '{"cudagraph_capture_sizes": [1]}' \
-		--scheduling-policy "sjf" \
-		--min-prefill-batch-size 2 \
-		--prefill-request-batching-timeout-ms 10000 \
-		--scheduler-delay-us 1000000 \
-		--reserved-block-num 29 \
-		--enable-prefill-pre-allocate
+		--compilation-config '{"cudagraph_capture_sizes": [1]}'
+
 
 
 cd -

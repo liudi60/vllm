@@ -116,6 +116,8 @@ def get_model(*,
     loader = get_model_loader(vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
+    # ===== loader.load_model, loader=<vllm.model_executor.model_loader.default_loader.DefaultModelLoader object at 0xfffeccce6010>
+    logger.warning(f'===== loader.load_model, loader={loader}')
     return loader.load_model(vllm_config=vllm_config,
                              model_config=model_config)
 

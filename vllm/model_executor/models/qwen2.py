@@ -316,6 +316,7 @@ class Qwen2Model(nn.Module):
 
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
+        print(f'===== decoder_layer_type={decoder_layer_type}')  # ===== decoder_layer_type=<class 'vllm.model_executor.models.qwen3.Qwen3DecoderLayer'>
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: decoder_layer_type(config=config,
@@ -378,6 +379,7 @@ class Qwen2Model(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
+        print(f'===== Qwen2Model.load_weights')
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -387,8 +389,11 @@ class Qwen2Model(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        print(f'===== Qwen2Model.load_weights, params_dict={params_dict}')
         loaded_params: set[str] = set()
+        aa = 0
         for name, loaded_weight in weights:
+            print(f'===== Qwen2Model.load_weights for {++aa}')
             if "rotary_emb.inv_freq" in name:
                 continue
             if (self.quant_config is not None and
@@ -417,8 +422,24 @@ class Qwen2Model(nn.Module):
                     if name is None:
                         continue
                 param = params_dict[name]
+
+                # print(f'===== Qwen2Model.load_weights, 1 param={param}')
+
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
+
+                '''
+                每个算子有自己的weight_loader方法：
+                (Worker_TP1 pid=37918) ===== Qwen2Model.load_weights, weight_loader=<function default_weight_loader at 0xffff260c4680>
+                (Worker_TP1 pid=37918) ===== Qwen2Model.load_weights, weight_loader=<function default_weight_loader at 0xffff260c4680>
+                (Worker_TP1 pid=37918) ===== Qwen2Model.load_weights, weight_loader=<bound method QKVParallelLinear.weight_loader of AscendQKVParallelLinear(in_features=4096, output_features=3072, bias=False, tp_size=2, gather_output=False)>
+                (Worker_TP1 pid=37918) ===== Qwen2Model.load_weights, weight_loader=<bound method QKVParallelLinear.weight_loader of AscendQKVParallelLinear(in_features=4096, output_features=3072, bias=False, tp_size=2, gather_output=False)>
+                (Worker_TP1 pid=37918) ===== Qwen2Model.load_weights, weight_loader=<bound method MergedColumnParallelLinear.weight_loader of AscendMergedColumnParallelLinear(in_features=4096, output_features=12288, bias=False, tp_size=2, gather_output=False)>
+                (Worker_TP1 pid=37918) ===== Qwen2Model.load_weights, weight_loader=<function default_weight_loader at 0xffff260c4680>
+                (Worker_TP1 pid=37918) ===== Qwen2Model.load_weights, weight_loader=<function default_weight_loader at 0xffff260c4680>
+                '''
+                # print(f'===== Qwen2Model.load_weights 1, weight_loader={weight_loader}')
+
                 if weight_loader == default_weight_loader:
                     weight_loader(param, loaded_weight)
                 else:
@@ -435,8 +456,15 @@ class Qwen2Model(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
+
+                # print(f'===== Qwen2Model.load_weights, 2 param={param}')
+                # torch中Parameter类型没有weight_loader方法，但是在vllm中动态加上了weight_loader方法，用来自定义权重加载或权重量化
+                # 此处，param有weight_loader方法则使用，没有则使用default_weight_loader
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
+
+                # print(f'===== Qwen2Model.load_weights 2, weight_loader={weight_loader}')
+
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

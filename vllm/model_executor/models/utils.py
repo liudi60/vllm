@@ -220,7 +220,92 @@ class AutoWeightsLoader:
         # Avoid infinite recursion since this function is typically
         # called inside load_weights of the module itself
         if module != self.module:
+            '''
+            ===== _load_module, self.module=Qwen3ForCausalLM(
+                      (model): Qwen3Model(
+                        (embed_tokens): AscendVocabParallelEmbedding(num_embeddings=75968, embedding_dim=4096, org_vocab_size=151936, num_embeddings_padded=151936, tp_size=2)
+                        (layers): ModuleList(
+                          (0-35): 36 x Qwen3DecoderLayer(
+                            (self_attn): Qwen3Attention(
+                              (qkv_proj): AscendQKVParallelLinear(in_features=4096, output_features=3072, bias=False, tp_size=2, gather_output=False)
+                              (o_proj): AscendRowParallelLinear(in_features=2048, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+                              (rotary_emb): AscendRotaryEmbedding(head_size=128, rotary_dim=128, max_position_embeddings=40960, base=1000000, is_neox_style=True)
+                              (attn): AscendAttention(head_size=128, num_heads=16, num_kv_heads=4, scale=0.08838834764831845, backend=AscendAttentionBackendImpl)
+                              (q_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+                              (k_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+                            )
+                            (mlp): Qwen2MLP(
+                              (gate_up_proj): AscendMergedColumnParallelLinear(in_features=4096, output_features=12288, bias=False, tp_size=2, gather_output=False)
+                              (down_proj): AscendRowParallelLinear(in_features=6144, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+                              (act_fn): AscendSiluAndMul()
+                            )
+                            (input_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                            (post_attention_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                          )
+                        )
+                        (norm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                      )
+                      (lm_head): AscendParallelLMHead(num_embeddings=75968, embedding_dim=4096, org_vocab_size=151936, num_embeddings_padded=151936, tp_size=2)
+                      (logits_processor): AscendLogitsProcessor(vocab_size=151936, org_vocab_size=151936, scale=1.0, logits_as_input=False)
+                    )
+            '''
+            logger.warning(f'===== _load_module, self.module={self.module}')
+            '''
+            ===== _load_module, module=AscendParallelLMHead(num_embeddings=75968, embedding_dim=4096, org_vocab_size=151936, num_embeddings_padded=151936, tp_size=2)
+            ===== _load_module, module=Qwen3Model(
+                      (embed_tokens): AscendVocabParallelEmbedding(num_embeddings=75968, embedding_dim=4096, org_vocab_size=151936, num_embeddings_padded=151936, tp_size=2)
+                      (layers): ModuleList(
+                        (0-35): 36 x Qwen3DecoderLayer(
+                          (self_attn): Qwen3Attention(
+                            (qkv_proj): AscendQKVParallelLinear(in_features=4096, output_features=3072, bias=False, tp_size=2, gather_output=False)
+                            (o_proj): AscendRowParallelLinear(in_features=2048, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+                            (rotary_emb): AscendRotaryEmbedding(head_size=128, rotary_dim=128, max_position_embeddings=40960, base=1000000, is_neox_style=True)
+                            (attn): AscendAttention(head_size=128, num_heads=16, num_kv_heads=4, scale=0.08838834764831845, backend=AscendAttentionBackendImpl)
+                            (q_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+                            (k_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+                          )
+                          (mlp): Qwen2MLP(
+                            (gate_up_proj): AscendMergedColumnParallelLinear(in_features=4096, output_features=12288, bias=False, tp_size=2, gather_output=False)
+                            (down_proj): AscendRowParallelLinear(in_features=6144, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+                            (act_fn): AscendSiluAndMul()
+                          )
+                          (input_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                          (post_attention_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                        )
+                      )
+                      (norm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                    )
+            '''
+            logger.warning(f'===== _load_module, module={module}')
             module_load_weights = getattr(module, "load_weights", None)
+            '''
+            只有这两种：
+            ===== _load_module, module_load_weights=None
+            ===== _load_module, module_load_weights=<bound method Qwen2Model.load_weights of Qwen3Model(
+                      (embed_tokens): AscendVocabParallelEmbedding(num_embeddings=75968, embedding_dim=4096, org_vocab_size=151936, num_embeddings_padded=151936, tp_size=2)
+                      (layers): ModuleList(
+                        (0-35): 36 x Qwen3DecoderLayer(
+                          (self_attn): Qwen3Attention(
+                            (qkv_proj): AscendQKVParallelLinear(in_features=4096, output_features=3072, bias=False, tp_size=2, gather_output=False)
+                            (o_proj): AscendRowParallelLinear(in_features=2048, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+                            (rotary_emb): AscendRotaryEmbedding(head_size=128, rotary_dim=128, max_position_embeddings=40960, base=1000000, is_neox_style=True)
+                            (attn): AscendAttention(head_size=128, num_heads=16, num_kv_heads=4, scale=0.08838834764831845, backend=AscendAttentionBackendImpl)
+                            (q_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+                            (k_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+                          )
+                          (mlp): Qwen2MLP(
+                            (gate_up_proj): AscendMergedColumnParallelLinear(in_features=4096, output_features=12288, bias=False, tp_size=2, gather_output=False)
+                            (down_proj): AscendRowParallelLinear(in_features=6144, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+                            (act_fn): AscendSiluAndMul()
+                          )
+                          (input_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                          (post_attention_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                        )
+                      )
+                      (norm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                    )>
+            '''
+            logger.warning(f'===== _load_module, module_load_weights={module_load_weights}')
             if callable(module_load_weights):
                 loaded_params = module_load_weights(weights)
                 if loaded_params is None:
@@ -236,6 +321,33 @@ class AutoWeightsLoader:
         child_modules = dict(module.named_children())
         child_params = dict(module.named_parameters(recurse=False))
 
+        '''
+        ===== _load_module, child_modules={'embed_tokens': AscendVocabParallelEmbedding(num_embeddings=75968, embedding_dim=4096, org_vocab_size=151936, num_embeddings_padded=151936, tp_size=2), 'layers': ModuleList(
+                  (0-35): 36 x Qwen3DecoderLayer(
+                    (self_attn): Qwen3Attention(
+                      (qkv_proj): AscendQKVParallelLinear(in_features=4096, output_features=3072, bias=False, tp_size=2, gather_output=False)
+                      (o_proj): AscendRowParallelLinear(in_features=2048, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+                      (rotary_emb): AscendRotaryEmbedding(head_size=128, rotary_dim=128, max_position_embeddings=40960, base=1000000, is_neox_style=True)
+                      (attn): AscendAttention(head_size=128, num_heads=16, num_kv_heads=4, scale=0.08838834764831845, backend=AscendAttentionBackendImpl)
+                      (q_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+                      (k_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+                    )
+                    (mlp): Qwen2MLP(
+                      (gate_up_proj): AscendMergedColumnParallelLinear(in_features=4096, output_features=12288, bias=False, tp_size=2, gather_output=False)
+                      (down_proj): AscendRowParallelLinear(in_features=6144, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+                      (act_fn): AscendSiluAndMul()
+                    )
+                    (input_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                    (post_attention_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+                  )
+                ), 'norm': AscendRMSNorm(hidden_size=4096, eps=1e-06)}
+        '''
+        logger.warning(f'===== _load_module, child_modules={child_modules}')
+        '''
+        ===== _load_module, child_params={}
+        '''
+        logger.warning(f'===== _load_module, child_params={child_params}')
+
         # Add missing tensors the weight loader needs to be able to load
         # that aren't registered as params, e.g., batchnorm statistics.
         self._add_loadable_non_param_tensors(module, child_params)
@@ -249,6 +361,7 @@ class AutoWeightsLoader:
 
                     continue
 
+                logger.warning(f'===== _load_module, self._load_module ')
                 yield from self._load_module(prefix,
                                              child_modules[child_prefix],
                                              child_weights)
@@ -258,6 +371,7 @@ class AutoWeightsLoader:
 
                     continue
 
+                logger.warning(f'===== _load_module, self._load_param ')
                 yield from self._load_param(prefix, child_params[child_prefix],
                                             child_weights)
             else:
@@ -290,7 +404,7 @@ class AutoWeightsLoader:
         # filter out weights with first-prefix/substr to skip in name
         weights = ((name, weight) for name, weight in weights
                    if not self._can_skip(name))
-
+        logger.warning(f'===== load_weights, ')
         autoloaded_weights = set(self._load_module("", self.module, weights))
         return autoloaded_weights
 
@@ -627,9 +741,31 @@ def make_layers(
                                             get_pp_group().world_size)
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)] + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
+            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))  # todo layer_fn
             for idx in range(start_layer, end_layer)
         ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
+
+    logger.warning(f'===== make_layers, start_layer={start_layer}, end_layer={end_layer}, modules[0]={modules[0]}')
+    '''
+    ===== make_layers, start_layer=0, end_layer=36, modules[0]=Qwen3DecoderLayer(
+      (self_attn): Qwen3Attention(
+        (qkv_proj): AscendQKVParallelLinear(in_features=4096, output_features=3072, bias=False, tp_size=2, gather_output=False)
+        (o_proj): AscendRowParallelLinear(in_features=2048, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+        (rotary_emb): AscendRotaryEmbedding(head_size=128, rotary_dim=128, max_position_embeddings=40960, base=1000000, is_neox_style=True)
+        (attn): AscendAttention(head_size=128, num_heads=16, num_kv_heads=4, scale=0.08838834764831845, backend=AscendAttentionBackendImpl)
+        (q_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+        (k_norm): AscendRMSNorm(hidden_size=128, eps=1e-06)
+      )
+      (mlp): Qwen2MLP(
+        (gate_up_proj): AscendMergedColumnParallelLinear(in_features=4096, output_features=12288, bias=False, tp_size=2, gather_output=False)
+        (down_proj): AscendRowParallelLinear(in_features=6144, output_features=4096, bias=False, tp_size=2, reduce_results=True)
+        (act_fn): AscendSiluAndMul()
+      )
+      (input_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+      (post_attention_layernorm): AscendRMSNorm(hidden_size=4096, eps=1e-06)
+    )
+    '''
+
     return start_layer, end_layer, modules
 
 

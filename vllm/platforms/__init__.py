@@ -185,9 +185,10 @@ def resolve_current_platform_cls_qualname() -> str:
     # ===== platform_plugins={'ascend': <function register at 0xfffda771cf40>}
     logger.warning(f'===== platform_plugins={platform_plugins}')
 
+    # 测试代码
     # 获取vllm-ascend插件定义入口路径
     import inspect
-    ascend_func = platform_plugins['ascend']
+    ascend_func = platform_plugins['ascend']  # 即 /home/liudi/vllm-workspace/vllm-ascend/vllm_ascend/__init__.py 中 register()函数
     file_path = inspect.getsourcefile(ascend_func)  # 获取函数定义所在的文件路径
     line_no = inspect.getsourcelines(ascend_func)[1]  # 返回 (lines, lineno)
     # ===== ascend_func file_path=/vllm-workspace/vllm-ascend/vllm_ascend/__init__.py, fun_name=register, line_no=19
@@ -210,6 +211,10 @@ def resolve_current_platform_cls_qualname() -> str:
             ===== platform_plugins, fun=<function register at 0xfffda771cf40>    # 这个就是ascend 
             '''
             logger.warning(f'===== platform_plugins, fun={func}')
+            '''
+            执行 /home/liudi/vllm-workspace/vllm-ascend/vllm_ascend/__init__.py 中 register()函数
+            register()函数直接返回一个字符串：return "vllm_ascend.platform.NPUPlatform"
+            '''
             platform_cls_qualname = func()
             if platform_cls_qualname is not None:
                 activated_plugins.append(name)
@@ -243,7 +248,7 @@ def resolve_current_platform_cls_qualname() -> str:
         platform_cls_qualname = "vllm.platforms.interface.UnspecifiedPlatform"
         logger.info(
             "No platform detected, vLLM is running on UnspecifiedPlatform")
-    return platform_cls_qualname
+    return platform_cls_qualname  # return "vllm_ascend.platform.NPUPlatform"
 
 
 _current_platform = None
@@ -394,13 +399,13 @@ def __getattr__(name: str):
             '''
 
 
-
+            # "vllm_ascend.platform.NPUPlatform"
             platform_cls_qualname = resolve_current_platform_cls_qualname()
             _current_platform = resolve_obj_by_qualname(
                 platform_cls_qualname)()
             global _init_trace
             _init_trace = "".join(traceback.format_stack())
-        return _current_platform
+        return _current_platform  # _current_platform 就是 class NPUPlatform(Platform) 这个类
     elif name in globals():
         return globals()[name]
     else:

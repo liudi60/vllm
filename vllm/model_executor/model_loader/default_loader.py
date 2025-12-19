@@ -127,6 +127,9 @@ class DefaultModelLoader(BaseModelLoader):
                     use_safetensors = True
                 break
 
+        # ===== _prepare_weights, model_name_or_path=Qwen3-8B-W8A8, hf_folder=Qwen3-8B-W8A8, hf_weights_files=['Qwen3-8B-W8A8/quant_model_weight_w8a8.safetensors']
+        logger.warning(f'===== _prepare_weights, model_name_or_path={model_name_or_path}, hf_folder={hf_folder}, hf_weights_files={hf_weights_files}')
+
         if use_safetensors:
             # For models like Mistral-7B-Instruct-v0.3
             # there are both sharded safetensors files and a consolidated
@@ -146,6 +149,9 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = filter_files_not_needed_for_inference(
                 hf_weights_files)
 
+        # ===== _prepare_weights, use_safetensors=True, hf_weights_files=['Qwen3-8B-W8A8/quant_model_weight_w8a8.safetensors']
+        logger.warning(f'===== _prepare_weights, use_safetensors={use_safetensors}, hf_weights_files={hf_weights_files}')
+
         if len(hf_weights_files) == 0:
             raise RuntimeError(
                 f"Cannot find any model weights with `{model_name_or_path}`")
@@ -157,6 +163,7 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
+        # hf_folder=Qwen3-8B-W8A8, use_safetensors=True, hf_weights_files=['Qwen3-8B-W8A8/quant_model_weight_w8a8.safetensors']
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt,
             source.allow_patterns_overrides)
@@ -171,6 +178,9 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
+            # ===== _get_weights_iterator, self.load_config.load_format=auto
+            logger.warning(f'===== _get_weights_iterator, self.load_config.load_format={self.load_config.load_format}')
+
             if self.load_config.load_format == "fastsafetensors":
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
@@ -186,6 +196,7 @@ class DefaultModelLoader(BaseModelLoader):
                                 "num_threads", self.DEFAULT_NUM_THREADS),
                         ))
                 else:
+                    # 走这里
                     weights_iterator = safetensors_weights_iterator(
                         hf_weights_files,
                         self.load_config.use_tqdm_on_load,
@@ -261,6 +272,11 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}
+
+        logger.warning(f'===== model.named_parameters()={model.named_parameters()}')
+        logger.warning(f'===== weights_to_load={weights_to_load}')
+
+        # loaded_weights 是一个可迭代对象，此处model对象是 Qwen3ForCausalLM 实例
         loaded_weights = model.load_weights(
             self.get_all_weights(model_config, model))
         self.counter_after_loading_weights = time.perf_counter()

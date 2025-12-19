@@ -444,6 +444,9 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
             try:
                 modelinfo_path = self._get_cache_dir(
                 ) / self._get_cache_filename()
+
+                logger.warning(f'===== _load_modelinfo_from_cache, modelinfo_path={modelinfo_path}')
+
                 with open(modelinfo_path, encoding="utf-8") as file:
                     mi_dict = json.load(file)
             except FileNotFoundError:
@@ -519,6 +522,8 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
 
     def load_model_cls(self) -> type[nn.Module]:
         mod = importlib.import_module(self.module_name)
+        # ===== load_model_cls, self.module_name=vllm.model_executor.models.qwen3, self.class_name=Qwen3ForCausalLM, mod=<module 'vllm.model_executor.models.qwen3' from '/home/liudi/vllm/vllm/model_executor/models/qwen3.py'>
+        logger.warning(f'===== load_model_cls, self.module_name={self.module_name}, self.class_name={self.class_name}, mod={mod}')
         return getattr(mod, self.class_name)
 
 
@@ -530,6 +535,8 @@ def _try_load_model_cls(
     from vllm.platforms import current_platform
     current_platform.verify_model_arch(model_arch)
     try:
+        # ===== _try_load_model_cls, model=_LazyRegisteredModel(module_name='vllm.model_executor.models.qwen3', class_name='Qwen3ForCausalLM')
+        logger.warning(f'===== _try_load_model_cls, model={model}')
         return model.load_model_cls()
     except Exception:
         logger.exception("Error in loading model architecture '%s'",
@@ -563,6 +570,7 @@ class _ModelRegistry:
         model_arch: str,
         model_cls: Union[type[nn.Module], str],
     ) -> None:
+        logger.warning(f'===== register_model')
         """
         Register an external model to be used in vLLM.
 
@@ -584,11 +592,17 @@ class _ModelRegistry:
                 "overwritten by the new model class %s.", model_arch,
                 model_cls)
 
+        logger.warning(f'===== register_model 1, model_cls={model_cls}')
+
         if isinstance(model_cls, str):
             split_str = model_cls.split(":")
             if len(split_str) != 2:
                 msg = "Expected a string in the format `<module>:<class>`"
                 raise ValueError(msg)
+            # 测试打印
+            if "Qwen" in model_cls:
+                # ===== register_model 2, model_cls=vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration
+                logger.warning(f'===== register_model 2, model_cls={model_cls}')
 
             model = _LazyRegisteredModel(*split_str)
         elif isinstance(model_cls, type) and issubclass(model_cls, nn.Module):
@@ -932,14 +946,13 @@ class _ModelRegistry:
         model_cls, _ = self.inspect_model_cls(architectures, model_config)
         return not model_cls.supports_v0_only
 
-
 ModelRegistry = _ModelRegistry({
     model_arch:
     _LazyRegisteredModel(
-        module_name=f"vllm.model_executor.models.{mod_relname}",
-        class_name=cls_name,
+        module_name=f"vllm.model_executor.models.{mod_relname}",  # deepseek_v2
+        class_name=cls_name,  # DeepseekV3ForCausalLM
     )
-    for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()
+    for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()  # "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
 })
 
 _T = TypeVar("_T")

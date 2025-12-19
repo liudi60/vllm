@@ -92,7 +92,7 @@ class MultiprocExecutor(Executor):
         try:
             for rank in range(self.world_size):
                 unready_workers.append(
-                    # todo 创建worker进程  VLLM::Worker_TP0、VLLM::Worker_TP1
+                    # todo 创建worker进程  VLLM::Worker_TP0、VLLM::Worker_TP1，每个卡对应1个进程
                     WorkerProc.make_worker_process(
                         vllm_config=self.vllm_config,
                         local_rank=rank,
@@ -462,18 +462,87 @@ class WorkerProc:
             "distributed_init_method": distributed_init_method,
             "is_driver_worker": is_driver_worker,
         }
-        wrapper.init_worker(all_kwargs)
+        wrapper.init_worker(all_kwargs)  # 创建 NPUWorker对象实例
         self.worker = wrapper
 
+        '''
+        出现在 vLLM 的多 GPU / 分布式推理架构（特别是 张量并行 Tensor Parallelism 或 RPC 通信场景）中，其核心目的是：
+
+        通过一个已创建的共享内存句柄（input_shm_handle），在当前 Worker 进程中重建一个 MessageQueue 对象，用于高效接收来自调度器（Scheduler）的输出数据（如 token IDs、请求元数据等）。
+        
+        🔍 逐部分解析
+        1. MessageQueue 是什么？
+        它是 vLLM 内部实现的一个 基于共享内存（Shared Memory）的进程间通信（IPC）队列。
+        用于在 Driver 进程（含 Scheduler） 和 Worker 进程（含模型执行引擎） 之间 零拷贝传递数据。
+        典型用途：
+        Scheduler → Workers：广播 SchedulerOutput（包含要处理的 requests、block tables、token IDs 等）
+        Workers → Driver：返回生成结果（在某些模式下）
+        ✅ 目标：避免序列化/反序列化 + 减少 CPU-GPU 同步开销
+        
+        2. create_from_handle(input_shm_handle, self.worker.rank)
+        input_shm_handle：
+        是一个 共享内存的“句柄”（handle），通常是一个字符串或整数 ID。
+        它由 主进程（Driver）预先创建，并在启动 Worker 时通过参数（如 CLI args、环境变量、pickle 传递）传给每个 Worker。
+        该句柄指向一块 所有进程可访问的共享内存区域。
+        self.worker.rank：
+        表示当前 Worker 的 全局 rank（例如在 TP=4 时，rank 为 0,1,2,3）。
+        用于：
+        确定从共享内存的哪个“槽位”读取数据（避免冲突）
+        实现 单写多读（Single Writer Multiple Readers） 模型
+        create_from_handle：
+        是一个 工厂方法，不创建新的共享内存，而是 “attach” 到已存在的共享内存段。
+        类似于：mmap 一个已知 fd，或打开一个已命名的 POSIX 共享内存对象。
+        📌 类比：就像多个进程通过同一个文件名打开 /dev/shm/my_queue。
+        '''
         # Initialize MessageQueue for receiving SchedulerOutput
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(
             input_shm_handle, self.worker.rank)
 
+        '''
+        表示 创建一个容量极小（通常为单槽）的进程间消息队列（Message Queue），用于 Worker 向 Driver（或调度器）返回响应结果。
+
+        🔍 逐部分解析
+        ✅ MessageQueue(1, 1) 的含义
+        虽然 MessageQueue 是 vLLM 内部自定义的 IPC 通信类（非标准库），但从命名和参数可合理推断：
+        
+        参数	含义（典型设计）
+        第一个 1	队列深度（capacity）：最多缓存 1 条消息
+        第二个 1	消费者数量（num_readers）：通常为 1（Driver 单线程读取）
+        💡 这是一个 SPSC（Single Producer Single Consumer）队列：
+        
+        Producer：当前 Worker 进程（写入推理结果）
+        Consumer：Driver / Scheduler 进程（读取结果）
+        🧠 设计目的：为什么需要这个队列？
+        在 vLLM 的 多进程架构（如张量并行 TP）中：
+        
+        Driver 进程：负责 HTTP API、请求调度（Scheduler）
+        Worker 进程（每个 GPU 一个）：执行模型前向计算
+        它们是 独立进程，无法直接共享 Python 对象，因此需要 IPC 机制传递结果。
+        
+        ✅ worker_response_mq 就是 Worker → Driver 的“回传通道”
+        
+        ⚙️ 为什么队列大小是 (1, 1)？
+        原因	        说明
+        同步通信模式	vLLM 通常采用 同步 step-by-step 推理：
+                    Driver 发一批请求 → 等所有 Workers 返回 → 再发下一批
+                    因此不需要缓冲多条消息
+        避免内存浪费	每个 Worker 都有一个响应队列，若设大容量会浪费共享内存
+        简化逻辑	    单槽队列天然具有 背压（backpressure）：
+                    若 Driver 未及时读取，Worker 会在 push() 时阻塞，防止生产过快
+                    📌 类似于：“每次只允许发一个 reply，等对方收走才能发下一个”
+        
+        💡 简单说：
+        “我（Worker）算完一步，就把结果放进这个‘小盒子’（容量=1），等你（Driver）来拿。你不拿，我就等着——这样我们步调一致，不会乱。”
+        '''
+        # todo 同步通信模式	vLLM 通常采用 同步 step-by-step 推理：
+        #  Driver 发一批请求 → 等所有 Workers 返回 → 再发下一批
+        #  因此不需要缓冲多条消息
         # Initializes a message queue for sending the model output
         self.worker_response_mq = MessageQueue(1, 1)
 
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
+        logger.warning(f'===== self.use_async_scheduling={self.use_async_scheduling}')
         if self.use_async_scheduling:
             self.async_output_queue: queue.Queue = queue.Queue()
             self.async_output_copy_thread = Thread(
@@ -901,7 +970,7 @@ class WorkerProc:
                 rpc_broadcast_mq：用于接收主进程的广播指令（如 shutdown）
                 ⚠️ 这是最耗时的步骤（GPU 显存分配、模型加载）
             '''
-            # 创建worker，
+            # 创建worker，里面工作主要是：初始化设备、创建NPUWorker实例、创建ModelRunner实例、加载模型权重
             worker = WorkerProc(*args, **kwargs)
 
             '''
@@ -1041,6 +1110,7 @@ class WorkerProc:
     def worker_busy_loop(self, cancel: Optional[threading.Event] = None):
         """Main busy loop for Multiprocessing Workers"""
         while True:
+            # EngineCore进程向所有worker进程广播"调度生成的batch"
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 cancel=cancel, indefinite=True)
             '''
@@ -1066,10 +1136,10 @@ class WorkerProc:
             ===== output_rank=0
             '''
             logger.warning(f'===== worker_busy_loop, self.rpc_broadcast_mq.dequeue')
-            logger.warning(f'===== method={method}')
-            logger.warning(f'===== args={args}')
-            logger.warning(f'===== kwargs={kwargs}')
-            logger.warning(f'===== output_rank={output_rank}')
+            logger.warning(f'===== method={method}')            # ===== method=get_kv_cache_spec
+            logger.warning(f'===== args={args}')                # {}
+            logger.warning(f'===== kwargs={kwargs}')            # {}
+            logger.warning(f'===== output_rank={output_rank}')  # None
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
